@@ -726,14 +726,31 @@ fn dep_remove(
         resolve_issue_id(&storage_ctx.storage, resolver, &args.depends_on)?
     };
 
-    let dep_type = dependency_type_for_pair(&storage_ctx.storage, &issue_id, &depends_on_id)?
+    let requested_type = args
+        .dep_type
+        .as_deref()
+        .map(parse_dependency_type)
+        .transpose()?;
+    let dep_type = requested_type
+        .as_ref()
+        .map_or_else(
+            || dependency_type_for_pair(&storage_ctx.storage, &issue_id, &depends_on_id),
+            |dep_type| Ok(Some(dep_type.as_str().to_string())),
+        )?
         .unwrap_or_else(|| "unknown".to_string());
     let removed = retry_mutation_with_jsonl_recovery(
         storage_ctx,
         true,
         "dep remove",
         Some(issue_id.as_str()),
-        |storage| storage.remove_dependency(&issue_id, &depends_on_id, actor),
+        |storage| {
+            storage.remove_dependency_typed(
+                &issue_id,
+                &depends_on_id,
+                requested_type.as_ref().map(DependencyType::as_str),
+                actor,
+            )
+        },
     )?;
 
     finalize_dep_mutation(storage_ctx, removed, "dep remove")?;
@@ -818,7 +835,7 @@ fn parse_dependency_type(dep_type: &str) -> Result<DependencyType> {
             reason: format!(
                 "Unknown dependency type: '{dep_type}'. \
                  Allowed types: blocks, parent-child, conditional-blocks, waits-for, \
-                 related, discovered-from, replies-to, relates-to, duplicates, \
+                 related, derived-from, implements, discovered-from, replies-to, relates-to, duplicates, \
                  supersedes, caused-by"
             ),
         });
@@ -2278,7 +2295,7 @@ mod tests {
     }
 
     #[test]
-    fn test_dep_import_bulk_storage_path_skips_type_distinct_duplicate_pairs() {
+    fn test_dep_import_bulk_storage_path_keeps_type_distinct_pairs() {
         let mut storage = SqliteStorage::open_memory().unwrap();
         for id in ["bd-source", "bd-target"] {
             storage
@@ -2304,14 +2321,14 @@ mod tests {
             )
             .unwrap();
 
-        assert_eq!(inserted, 1);
+        assert_eq!(inserted, 2);
         let dep_types: Vec<String> = storage
             .get_dependencies_full("bd-source")
             .unwrap()
             .into_iter()
             .map(|dep| dep.dep_type.as_str().to_string())
             .collect();
-        assert_eq!(dep_types, vec!["blocks".to_string()]);
+        assert_eq!(dep_types, vec!["blocks".to_string(), "related".to_string()]);
     }
 
     #[test]
@@ -2776,6 +2793,8 @@ mod tests {
 
     #[test]
     fn test_dep_tree_diamond_graph_is_bounded() {
+        const RUNGS: usize = 20;
+
         // Regression for #392: a "diamond ladder" DAG (A_i depends on B_i and
         // C_i; both depend on A_{i+1}) is reachable via 2^i distinct simple
         // paths. Without a global expansion guard the traversal emitted
@@ -2785,7 +2804,6 @@ mod tests {
         info!("test_dep_tree_diamond_graph_is_bounded: starting");
         let mut storage = SqliteStorage::open_memory().unwrap();
 
-        const RUNGS: usize = 20;
         let a: Vec<String> = (0..=RUNGS).map(|i| format!("bd-a{i:03}")).collect();
         let b: Vec<String> = (0..RUNGS).map(|i| format!("bd-b{i:03}")).collect();
         let c: Vec<String> = (0..RUNGS).map(|i| format!("bd-c{i:03}")).collect();

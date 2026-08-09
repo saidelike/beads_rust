@@ -780,12 +780,14 @@ fn execute_route(
     beads_dir: &Path,
     auto_flush_external: bool,
 ) -> Result<CloseExecution> {
-    let _routed_write_lock =
+    let routed_write_lock =
         acquire_routed_workspace_write_lock(beads_dir, auto_flush_external, cli.lock_timeout)?;
-    let mut storage_ctx = config::open_storage_with_cli(beads_dir, cli)?;
-    auto_import_storage_ctx_if_stale(&mut storage_ctx, cli)?;
+    let mut route_cli = cli.clone();
+    routed_write_lock.mark_cli_write_lock_held(&mut route_cli);
+    let mut storage_ctx = config::open_storage_with_cli(beads_dir, &route_cli)?;
+    auto_import_storage_ctx_if_stale(&mut storage_ctx, &route_cli)?;
 
-    let config_layer = storage_ctx.load_config(cli)?;
+    let config_layer = storage_ctx.load_config(&route_cli)?;
     let actor = config::resolve_actor(&config_layer);
     let id_config = config::id_config_from_layer(&config_layer);
     let resolver = IdResolver::new(ResolverConfig::with_prefix(id_config.prefix));
@@ -863,7 +865,13 @@ fn execute_route(
             continue;
         }
 
+        let type_capabilities = storage_ctx
+            .storage
+            .issue_type_registry()
+            .capabilities_for_name(issue.issue_type.as_str());
+
         if !args.force
+            && !type_capabilities.may_close_with_open_children
             && let Some(&(total, closed)) = epic_counts.get(id)
             && closed < total
         {
@@ -892,7 +900,8 @@ fn execute_route(
         // children occur with legacy-bd migrations, bulk JSONL imports,
         // and hand-edited JSONL. Without this check, closing the parent
         // silently orphans the open children.
-        let requested_dot_children = if args.force {
+        let requested_dot_children = if args.force || type_capabilities.may_close_with_open_children
+        {
             Vec::new()
         } else {
             let open_dot_children = storage_ctx.storage.get_open_dot_notation_children(id)?;
@@ -1797,7 +1806,7 @@ mod tests {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let temp = TempDir::new().expect("tempdir");
         let ctx = OutputContext::from_flags(false, false, true);
-        commands::init::execute(None, false, Some(temp.path()), &ctx).expect("init");
+        commands::init::execute(None, false, None, Some(temp.path()), &ctx).expect("init");
 
         let beads_dir = temp.path().join(".beads");
         let db_path = beads_dir.join("beads.db");
@@ -1847,7 +1856,7 @@ mod tests {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let temp = TempDir::new().expect("tempdir");
         let ctx = OutputContext::from_flags(false, false, true);
-        commands::init::execute(None, false, Some(temp.path()), &ctx).expect("init");
+        commands::init::execute(None, false, None, Some(temp.path()), &ctx).expect("init");
 
         let beads_dir = temp.path().join(".beads");
         let db_path = beads_dir.join("beads.db");
@@ -1898,7 +1907,7 @@ mod tests {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let temp = TempDir::new().expect("tempdir");
         let ctx = OutputContext::from_flags(false, false, true);
-        commands::init::execute(None, false, Some(temp.path()), &ctx).expect("init");
+        commands::init::execute(None, false, None, Some(temp.path()), &ctx).expect("init");
 
         let beads_dir = temp.path().join(".beads");
         let db_path = beads_dir.join("beads.db");
@@ -1940,7 +1949,7 @@ mod tests {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let temp = TempDir::new().expect("tempdir");
         let ctx = OutputContext::from_flags(false, false, true);
-        commands::init::execute(None, false, Some(temp.path()), &ctx).expect("init");
+        commands::init::execute(None, false, None, Some(temp.path()), &ctx).expect("init");
 
         let beads_dir = temp.path().join(".beads");
         let db_path = beads_dir.join("beads.db");
@@ -1977,6 +1986,67 @@ mod tests {
     }
 
     #[test]
+    fn configured_type_closes_normally_with_open_children() {
+        let _lock = crate::util::test_helpers::TEST_DIR_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let temp = TempDir::new().expect("tempdir");
+        let ctx = OutputContext::from_flags(false, false, true);
+        commands::init::execute(None, false, None, Some(temp.path()), &ctx).expect("init");
+
+        let beads_dir = temp.path().join(".beads");
+        std::fs::write(
+            beads_dir.join(crate::close_policy::POLICY_FILE_NAME),
+            "issue_types:\n  types:\n    - name: spec\n      capabilities:\n        aggregate: true\n        may_close_with_open_children: true\n",
+        )
+        .expect("write policy");
+        let db_path = beads_dir.join("beads.db");
+        let mut storage = SqliteStorage::open(&db_path).expect("storage");
+        let mut spec = make_issue("bd-spec", "Published specification");
+        spec.issue_type = IssueType::Custom("spec".to_string());
+        storage.create_issue(&spec, "tester").expect("create spec");
+        storage
+            .create_issue(&make_issue("bd-implementation", "Implementation"), "tester")
+            .expect("create implementation");
+        storage
+            .add_dependency(
+                "bd-implementation",
+                "bd-spec",
+                DependencyType::ParentChild.as_str(),
+                "tester",
+            )
+            .expect("add parent-child dependency");
+        drop(storage);
+
+        let _guard = DirGuard::new(temp.path());
+        let args = CloseArgs {
+            ids: vec!["bd-spec".to_string()],
+            reason: Some("Specification published".to_string()),
+            ..CloseArgs::default()
+        };
+        execute_with_args(&args, true, &CliOverrides::default(), &ctx)
+            .expect("configured spec close should succeed without force");
+
+        let storage = SqliteStorage::open(&db_path).expect("reopen storage");
+        assert_eq!(
+            storage
+                .get_issue("bd-spec")
+                .expect("read spec")
+                .expect("spec exists")
+                .status,
+            Status::Closed
+        );
+        assert_eq!(
+            storage
+                .get_issue("bd-implementation")
+                .expect("read child")
+                .expect("child exists")
+                .status,
+            Status::Open
+        );
+    }
+
+    #[test]
     fn execute_with_args_closes_child_even_when_parent_epic_is_blocked() {
         // Regression for #355: a finished child must be closable even while its
         // parent epic is itself blocked by an unrelated prerequisite. The
@@ -1988,7 +2058,7 @@ mod tests {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let temp = TempDir::new().expect("tempdir");
         let ctx = OutputContext::from_flags(false, false, true);
-        commands::init::execute(None, false, Some(temp.path()), &ctx).expect("init");
+        commands::init::execute(None, false, None, Some(temp.path()), &ctx).expect("init");
 
         let beads_dir = temp.path().join(".beads");
         let db_path = beads_dir.join("beads.db");
@@ -2078,7 +2148,7 @@ mod tests {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let temp = TempDir::new().expect("tempdir");
         let ctx = OutputContext::from_flags(false, false, true);
-        commands::init::execute(None, false, Some(temp.path()), &ctx).expect("init");
+        commands::init::execute(None, false, None, Some(temp.path()), &ctx).expect("init");
 
         let beads_dir = temp.path().join(".beads");
         let db_path = beads_dir.join("beads.db");
@@ -2121,7 +2191,7 @@ mod tests {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let temp = TempDir::new().expect("tempdir");
         let ctx = OutputContext::from_flags(false, false, true);
-        commands::init::execute(None, false, Some(temp.path()), &ctx).expect("init");
+        commands::init::execute(None, false, None, Some(temp.path()), &ctx).expect("init");
 
         let beads_dir = temp.path().join(".beads");
         let db_path = beads_dir.join("beads.db");
@@ -2213,7 +2283,7 @@ mod tests {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let temp = TempDir::new().expect("tempdir");
         let ctx = OutputContext::from_flags(false, false, true);
-        commands::init::execute(None, false, Some(temp.path()), &ctx).expect("init");
+        commands::init::execute(None, false, None, Some(temp.path()), &ctx).expect("init");
 
         let beads_dir = temp.path().join(".beads");
         let db_path = beads_dir.join("beads.db");
@@ -2257,7 +2327,7 @@ mod tests {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let temp = TempDir::new().expect("tempdir");
         let ctx = OutputContext::from_flags(false, false, true);
-        commands::init::execute(None, false, Some(temp.path()), &ctx).expect("init");
+        commands::init::execute(None, false, None, Some(temp.path()), &ctx).expect("init");
 
         let beads_dir = temp.path().join(".beads");
         let db_path = beads_dir.join("beads.db");
@@ -2317,7 +2387,7 @@ mod tests {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let temp = TempDir::new().expect("tempdir");
         let ctx = OutputContext::from_flags(false, false, true);
-        commands::init::execute(None, false, Some(temp.path()), &ctx).expect("init");
+        commands::init::execute(None, false, None, Some(temp.path()), &ctx).expect("init");
 
         let beads_dir = temp.path().join(".beads");
         let db_path = beads_dir.join("beads.db");
@@ -2356,7 +2426,7 @@ mod tests {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let temp = TempDir::new().expect("tempdir");
         let ctx = OutputContext::from_flags(false, false, true);
-        commands::init::execute(None, false, Some(temp.path()), &ctx).expect("init");
+        commands::init::execute(None, false, None, Some(temp.path()), &ctx).expect("init");
 
         let beads_dir = temp.path().join(".beads");
         let db_path = beads_dir.join("beads.db");
@@ -2469,7 +2539,7 @@ mod tests {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let temp = TempDir::new().expect("tempdir");
         let ctx = OutputContext::from_flags(false, false, true);
-        commands::init::execute(None, false, Some(temp.path()), &ctx).expect("init");
+        commands::init::execute(None, false, None, Some(temp.path()), &ctx).expect("init");
 
         let beads_dir = temp.path().join(".beads");
         let db_path = beads_dir.join("beads.db");
@@ -2500,7 +2570,7 @@ mod tests {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let temp = TempDir::new().expect("tempdir");
         let ctx = OutputContext::from_flags(false, false, true);
-        commands::init::execute(None, false, Some(temp.path()), &ctx).expect("init");
+        commands::init::execute(None, false, None, Some(temp.path()), &ctx).expect("init");
 
         let beads_dir = temp.path().join(".beads");
         let db_path = beads_dir.join("beads.db");
@@ -2553,7 +2623,7 @@ mod tests {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let temp = TempDir::new().expect("tempdir");
         let ctx = OutputContext::from_flags(false, false, true);
-        commands::init::execute(None, false, Some(temp.path()), &ctx).expect("init");
+        commands::init::execute(None, false, None, Some(temp.path()), &ctx).expect("init");
 
         let beads_dir = temp.path().join(".beads");
         let db_path = beads_dir.join("beads.db");
@@ -2589,7 +2659,7 @@ mod tests {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let temp = TempDir::new().expect("tempdir");
         let ctx = OutputContext::from_flags(false, false, true);
-        commands::init::execute(None, false, Some(temp.path()), &ctx).expect("init");
+        commands::init::execute(None, false, None, Some(temp.path()), &ctx).expect("init");
 
         let beads_dir = temp.path().join(".beads");
         let db_path = beads_dir.join("beads.db");
@@ -2658,7 +2728,7 @@ mod tests {
 
     fn setup_gate_repo(temp: &TempDir, status: Status) -> std::path::PathBuf {
         let ctx = OutputContext::from_flags(false, false, true);
-        commands::init::execute(None, false, Some(temp.path()), &ctx).expect("init");
+        commands::init::execute(None, false, None, Some(temp.path()), &ctx).expect("init");
         let beads_dir = temp.path().join(".beads");
         std::fs::write(beads_dir.join("policy.yaml"), GATE_POLICY_YAML).expect("write policy");
         let db_path = beads_dir.join("beads.db");
@@ -2776,7 +2846,7 @@ mod tests {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let temp = TempDir::new().expect("tempdir");
         let ctx = OutputContext::from_flags(false, false, true);
-        commands::init::execute(None, false, Some(temp.path()), &ctx).expect("init");
+        commands::init::execute(None, false, None, Some(temp.path()), &ctx).expect("init");
         let beads_dir = temp.path().join(".beads");
         let db_path = beads_dir.join("beads.db");
         {

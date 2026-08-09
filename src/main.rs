@@ -81,17 +81,20 @@ fn main() {
     // owns a richer dedicated finding/refusal surface.
     let pending_merge_disposition = pending_merge_startup_disposition(&cli.command);
     let mut pending_merge_warning_emitted = false;
+    let mut pending_merge_read_only_gate_required = false;
     if ctx.is_initialized()
         && !ctx.no_db()
         && (command_needs_write_lock || should_preopen_storage)
+        && command_requires_startup_pending_merge_inspection(&cli.command)
         && pending_merge_disposition == PendingMergeStartupDisposition::ReadOnlyNoAutoSync
         && !matches!(cli.command, Commands::Doctor(_))
         && let Some(paths) = ctx.paths.as_ref()
     {
-        match commands::doctor::inspect_pending_sync_merge_at_path(&paths.db_path) {
+        match inspect_pending_sync_merge_for_startup(&paths.db_path) {
             Ok(Some(state)) => {
                 emit_pending_sync_merge_warning(&state, json_error_mode);
                 pending_merge_warning_emitted = true;
+                pending_merge_read_only_gate_required = true;
                 // Read-only commands remain available, but their convenience
                 // auto-import and every command-local storage fallback must
                 // not advance either side of the saga. Force current-schema
@@ -103,8 +106,15 @@ fn main() {
                     storage_enabled && supports_read_only_fast_open(&cli.command);
             }
             Ok(None) => {}
+            Err(error) if legacy_schema_can_auto_migrate(&error) => {
+                tracing::info!(
+                    error = %error,
+                    "Legacy database predates reviewed migration receipts; deferring its schema upgrade to the authority-bound storage open"
+                );
+            }
             Err(error) => {
                 emit_pending_sync_merge_inspection_warning(&error, json_error_mode);
+                pending_merge_read_only_gate_required = true;
                 should_auto_import_now = false;
                 force_pending_merge_read_only_mode(&mut overrides, &mut ctx);
                 should_preopen_storage =
@@ -119,25 +129,24 @@ fn main() {
     //
     // Issue #243: frankensqlite deadlocks when multiple processes attempt
     // concurrent writes to the same database file. Serialize all mutating
-    // operations through a blocking flock on `.beads/.write.lock`. Normal
-    // storage open is not guaranteed read-only in recovery/schema paths, so
-    // DB-family commands hold authority even when they first try the
-    // current-schema read-only fast-open path. That keeps the pending-saga
-    // verdict stable and prevents a fast-open miss from entering writable
-    // recovery without a definitive gate.
+    // operations through a blocking flock on `.beads/.write.lock`. A
+    // current-schema read-only fast open does not need startup authority. Its
+    // fallback acquires database-family authority before entering any recovery
+    // or schema path. Mutating commands and non-fast-open preopens still
+    // acquire authority here, as does the separate pending-saga gate.
     let ordinary_database_authority_required = should_acquire_startup_write_lock(
         command_needs_write_lock,
         should_preopen_storage,
         ctx.overrides.read_only_fast_open,
     );
     let pending_merge_mutation_gate_required =
-        pending_merge_disposition == PendingMergeStartupDisposition::Refuse;
+        pending_merge_disposition.refuses_inspectable_receipt();
     let startup_database_authority_required = startup_database_authority_required(
         ctx.no_db(),
         ordinary_database_authority_required,
         no_db_jsonl_write,
         pending_merge_mutation_gate_required,
-    );
+    ) || pending_merge_read_only_gate_required;
     let write_lock = if startup_database_authority_required && ctx.is_initialized() {
         let lock_timeout = ctx.startup_write_lock_timeout(&cli.command);
         match ctx
@@ -228,13 +237,14 @@ fn main() {
     } else {
         None
     };
-    // Every non-merge DB-family caller inspects only after startup has obtained
-    // its database-family write lock. This prevents a concurrent merge from
-    // changing the receipt between the gate decision and storage open. Read
-    // commands may continue on a classified pending receipt, but only in
-    // current-schema read-only mode with automatic sync disabled. Inspection
-    // uncertainty fails closed because a fast-open fallback could otherwise
-    // recover or migrate the database before the command executes.
+    // Every non-merge DB-family caller that can mutate or enter writable
+    // fallback inspects only after startup has obtained its database-family
+    // write lock. This prevents a concurrent merge from changing the receipt
+    // between the gate decision and storage open. Lock-free current-schema
+    // fast reads rely on the advisory check above and cannot advance either
+    // artifact. Read commands may continue on a classified pending receipt,
+    // but only in current-schema read-only mode with automatic sync disabled.
+    // Inspection uncertainty fails closed before any writable path executes.
     if ctx.is_initialized()
         && ctx.no_db()
         && (no_db_jsonl_write || pending_merge_mutation_gate_required)
@@ -251,13 +261,21 @@ fn main() {
                 color_error_mode,
             )
         });
-        match inspect_pending_sync_merge_for_no_db_write(&paths.db_path, authority) {
+        match inspect_pending_sync_merge_for_startup_under_authority(&paths.db_path, authority) {
             Ok(Some(state)) => handle_error(
                 &pending_sync_merge_no_db_refusal_error(&state),
                 json_error_mode,
                 color_error_mode,
             ),
             Ok(None) => {}
+            Err(error @ BeadsError::SchemaMismatch { .. })
+                if legacy_schema_can_auto_migrate(&error) =>
+            {
+                tracing::info!(
+                    error = %error,
+                    "Legacy database predates reviewed migration receipts; allowing no-DB startup under held database-family authority"
+                );
+            }
             Err(error @ BeadsError::SchemaMismatch { .. }) => {
                 let routed = reviewed_schema_migration_required(error);
                 handle_error(&routed, json_error_mode, color_error_mode)
@@ -274,9 +292,8 @@ fn main() {
         }
     } else if ctx.is_initialized()
         && !ctx.no_db()
-        && (command_needs_write_lock
-            || should_preopen_storage
-            || pending_merge_mutation_gate_required)
+        && startup_database_authority_required
+        && command_requires_startup_pending_merge_inspection(&cli.command)
         && pending_merge_disposition != PendingMergeStartupDisposition::Resume
         && !matches!(cli.command, Commands::Doctor(_))
         && let Some(paths) = ctx.paths.as_ref()
@@ -292,12 +309,8 @@ fn main() {
                 color_error_mode,
             )
         });
-        match commands::doctor::inspect_pending_sync_merge_under_authority(
-            &paths.db_path,
-            authority,
-        ) {
-            Ok(Some(state))
-                if pending_merge_disposition == PendingMergeStartupDisposition::Refuse =>
+        match inspect_pending_sync_merge_for_startup_under_authority(&paths.db_path, authority) {
+            Ok(Some(state)) if pending_merge_disposition.refuses_inspectable_receipt() =>
             {
                 handle_error(
                     &pending_sync_merge_refusal_error(&state),
@@ -315,9 +328,39 @@ fn main() {
                     storage_enabled && supports_read_only_fast_open(&cli.command);
             }
             Ok(None) => {}
+            Err(error @ BeadsError::SchemaMismatch { .. })
+                if legacy_schema_can_auto_migrate(&error) =>
+            {
+                tracing::info!(
+                    error = %error,
+                    "Legacy database predates reviewed migration receipts; deferring its schema upgrade to the authority-bound storage open"
+                );
+            }
             Err(error @ BeadsError::SchemaMismatch { .. }) => {
                 let routed = reviewed_schema_migration_required(error);
                 handle_error(&routed, json_error_mode, color_error_mode);
+            }
+            Err(error)
+                if pending_merge_disposition
+                    == PendingMergeStartupDisposition::CommandOwnedRecovery
+                    && paths.jsonl_path.is_file()
+                    && commands::doctor::command_owned_recovery_may_replace_uninspectable_database(
+                        &paths.db_path,
+                        authority,
+                    ) =>
+            {
+                // `sync --import-only --rename-prefix` deliberately owns the
+                // deferred recovery transaction. A stable database that is
+                // not current-schema-readable cannot expose a trustworthy
+                // pending receipt, so the command preserves the exact family,
+                // installs a placeholder, and restores the family on any
+                // validation/import failure. Inspectable pending receipts and
+                // stale/future schemas still take the refusal paths above.
+                tracing::warn!(
+                    db_path = %paths.db_path.display(),
+                    error = %error,
+                    "Deferring uninspectable database recovery to explicit rename-prefix import"
+                );
             }
             Err(error) => {
                 handle_error(
@@ -479,7 +522,13 @@ fn main() {
             prefix,
             force,
             backend: _,
-        } => commands::init::execute(prefix, force, None, &output_ctx),
+            redirect,
+        } => commands::init::execute(prefix, force, redirect, None, &output_ctx),
+        Commands::Redirect { command } => match command {
+            beads_rust::cli::RedirectCommands::Set(args) => {
+                commands::redirect::execute_set(&args, &output_ctx)
+            }
+        },
         Commands::Create(args) => {
             execute_create_command(&args, &overrides, &output_ctx, &mut storage_result)
         }
@@ -582,6 +631,9 @@ fn main() {
                 commands::epic::execute(&command, cli.json, &overrides, &output_ctx)
             }
         }
+        Commands::Roadmap(args) => {
+            commands::roadmap::execute(&args, &overrides, &output_ctx, storage_result.as_ref())
+        }
         Commands::Gate { command } => commands::gate::execute(&command, &overrides, &output_ctx),
         Commands::Capacity { command } => {
             commands::capacity::execute(&command, &overrides, &output_ctx)
@@ -628,7 +680,9 @@ fn main() {
                 commands::count::execute(&args, cli.json, &overrides, &output_ctx)
             }
         }
-        Commands::Capabilities(args) => commands::capabilities::execute(&args, &output_ctx),
+        Commands::Capabilities(args) => {
+            commands::capabilities::execute(&args, &overrides, &output_ctx)
+        }
         Commands::Stale(args) => storage_result.as_ref().map_or_else(
             || commands::stale::execute(&args, &overrides, &output_ctx),
             |res| commands::stale::execute_with_storage(&args, &output_ctx, &res.storage),
@@ -980,6 +1034,25 @@ fn command_is_doctor_repair(command: &Commands) -> bool {
     matches!(command, Commands::Doctor(args) if (args.repair || args.repair_indexes) && !args.robot_triage)
 }
 
+/// Whether startup must inspect the live pending-merge receipt before command
+/// execution.
+///
+/// Read-only config inspection snapshots the optional DB layer without opening,
+/// migrating, or repairing live storage and deliberately ignores an unreadable
+/// DB layer so project/user YAML remains inspectable. It still holds the normal
+/// workspace authority while copying that snapshot, but does not need the
+/// storage mutation gate used by commands that can enter a writable fallback.
+const fn command_requires_startup_pending_merge_inspection(command: &Commands) -> bool {
+    !matches!(
+        command,
+        Commands::Config {
+            command: beads_rust::cli::ConfigCommands::Get { .. }
+                | beads_rust::cli::ConfigCommands::List { .. }
+                | beads_rust::cli::ConfigCommands::Path,
+        }
+    )
+}
+
 const fn doctor_subcommand_needs_write_lock(args: &beads_rust::cli::DoctorArgs) -> bool {
     match &args.subcommand {
         None
@@ -1045,11 +1118,14 @@ const fn sync_mode_opens_storage(args: &beads_rust::cli::SyncArgs) -> bool {
 const fn should_acquire_startup_write_lock(
     command_needs_write_lock: bool,
     should_preopen_storage: bool,
-    _read_only_fast_open: bool,
+    read_only_fast_open: bool,
 ) -> bool {
-    command_needs_write_lock || should_preopen_storage
+    !read_only_fast_open && (command_needs_write_lock || should_preopen_storage)
 }
 
+// These named booleans are the predicate's complete truth table; introducing
+// wrapper enums would obscure the direct startup-state correspondence.
+#[allow(clippy::fn_params_excessive_bools)]
 const fn startup_database_authority_required(
     no_db: bool,
     ordinary_database_authority_required: bool,
@@ -1118,7 +1194,7 @@ const fn command_must_refuse_during_pending_merge(cmd: &Commands) -> bool {
         return true;
     }
     match cmd {
-        Commands::Init { .. } => true,
+        Commands::Init { redirect, .. } => redirect.is_none(),
         Commands::Sync(args) => {
             args.flush_only || args.import_only || (args.reconcile_additive && args.apply)
         }
@@ -1172,13 +1248,24 @@ enum PendingMergeStartupDisposition {
     Resume,
     /// A tracker/workspace mutation must fail before storage open.
     Refuse,
+    /// A rename-prefix import still refuses inspectable pending receipts, but
+    /// owns backup/recovery when the database cannot be inspected at all.
+    CommandOwnedRecovery,
     /// A read-only command may run, but automatic import/export is disabled.
     ReadOnlyNoAutoSync,
+}
+
+impl PendingMergeStartupDisposition {
+    const fn refuses_inspectable_receipt(self) -> bool {
+        matches!(self, Self::Refuse | Self::CommandOwnedRecovery)
+    }
 }
 
 const fn pending_merge_startup_disposition(cmd: &Commands) -> PendingMergeStartupDisposition {
     if command_is_sync_merge(cmd) {
         PendingMergeStartupDisposition::Resume
+    } else if matches!(cmd, Commands::Sync(args) if args.import_only && args.rename_prefix) {
+        PendingMergeStartupDisposition::CommandOwnedRecovery
     } else if command_must_refuse_during_pending_merge(cmd) {
         PendingMergeStartupDisposition::Refuse
     } else {
@@ -1220,6 +1307,14 @@ fn reviewed_schema_migration_required(source: BeadsError) -> BeadsError {
     }
 }
 
+fn legacy_schema_can_auto_migrate(error: &BeadsError) -> bool {
+    matches!(
+        error,
+        BeadsError::SchemaMismatch { found, .. }
+            if beads_rust::storage::schema::schema_version_predates_reviewed_migrations(*found)
+    )
+}
+
 fn pending_sync_merge_no_db_refusal_error(
     state: &commands::doctor::PendingSyncMergeState,
 ) -> BeadsError {
@@ -1232,10 +1327,27 @@ fn pending_sync_merge_no_db_refusal_error(
     }
 }
 
-fn inspect_pending_sync_merge_for_no_db_write(
+fn inspect_pending_sync_merge_for_startup(
+    db_path: &Path,
+) -> Result<Option<commands::doctor::PendingSyncMergeState>> {
+    // A missing database is the normal pre-import state for a JSONL-only
+    // checkout. It cannot contain a pending receipt, so startup must remain
+    // free to create and import it. Doctor still reports the missing database
+    // as a finding through its stricter public inspector.
+    match fs::symlink_metadata(db_path) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        _ => commands::doctor::inspect_pending_sync_merge_at_path(db_path),
+    }
+}
+
+fn inspect_pending_sync_merge_for_startup_under_authority(
     db_path: &Path,
     authority: &Arc<beads_rust::sync::DatabaseFamilyWriteLock>,
 ) -> Result<Option<commands::doctor::PendingSyncMergeState>> {
+    // Binding an exactly absent database under the held family authority makes
+    // that absence definitive for the startup gate. The subsequent writable
+    // open may then initialize it without leaving an unchecked replacement
+    // window.
     if authority.bind_database_inode_for_mutation()? {
         authority.verify_database_authority()?;
         return Ok(None);
@@ -1357,12 +1469,16 @@ const fn needs_write_lock(cmd: &Commands) -> bool {
         | Commands::Dep { .. }
         | Commands::Label { .. }
         | Commands::Epic { .. }
+        | Commands::Roadmap(_)
         | Commands::Query { .. }
         | Commands::Orphans(_)
         | Commands::Audit { .. }
         | Commands::Info(_)
         | Commands::Where
-        | Commands::Init { .. } => true,
+        | Commands::Init { redirect: None, .. } => true,
+        Commands::Init {
+            redirect: Some(_), ..
+        } => false,
         Commands::Doctor(args) => doctor_subcommand_needs_write_lock(args),
         Commands::Sync(args) => sync_mode_opens_storage(args),
         Commands::Config { command } => !matches!(
@@ -1408,11 +1524,13 @@ const fn should_auto_import(cmd: &Commands) -> bool {
         | Commands::Dep { .. }
         | Commands::Label { .. }
         | Commands::Epic { .. }
+        | Commands::Roadmap(_)
         | Commands::Gate { .. }
         | Commands::Capacity { .. }
         | Commands::Query { .. } => true,
 
         Commands::Init { .. }
+        | Commands::Redirect { .. }
         | Commands::Sync(_)
         | Commands::Doctor(_)
         | Commands::Info(_)
@@ -1456,6 +1574,7 @@ const fn supports_read_only_fast_open(cmd: &Commands) -> bool {
         | Commands::Lint(_)
         | Commands::Changelog(_)
         | Commands::Graph(_)
+        | Commands::Roadmap(_)
         | Commands::Orphans(beads_rust::cli::OrphansArgs { fix: false, .. })
         | Commands::Comments(beads_rust::cli::CommentsArgs {
             command: None | Some(beads_rust::cli::CommentCommands::List(_)),
@@ -1517,6 +1636,10 @@ fn command_requested_output_format(cmd: &Commands) -> Option<OutputFormat> {
             beads_rust::cli::RobotDocsCommands::Guide(args) => args.format.map(Into::into),
         },
         Commands::Ready(args) => args.format.map(Into::into),
+        Commands::Roadmap(args) => match args.format {
+            Some(beads_rust::cli::RoadmapOutputFormat::Json) => Some(OutputFormat::Json),
+            _ => None,
+        },
         Commands::Scheduler(args) => args.format.map(Into::into),
         Commands::Blocked(args) => args.format.map(Into::into),
         Commands::Stats(args) | Commands::Status(args) => args.format.map(Into::into),
@@ -1651,7 +1774,9 @@ fn is_unwritable_write_lock_open_error(lock_path: &Path, err: &BeadsError) -> bo
     let BeadsError::Config(message) = err else {
         return false;
     };
-    message.contains("Failed to open write lock") && write_lock_lacks_owner_write(lock_path)
+    (message.contains("Failed to open write lock")
+        || message.contains("Failed to open workspace write lock"))
+        && write_lock_lacks_owner_write(lock_path)
 }
 
 fn is_write_lock_contention_error(lock_path: &Path, err: &BeadsError) -> bool {
@@ -2659,19 +2784,42 @@ mod tests {
     }
 
     #[test]
-    fn read_only_fast_open_holds_authority_before_any_fallback() {
+    fn read_only_fast_open_defers_authority_until_fallback() {
         assert!(
-            should_acquire_startup_write_lock(true, false, true),
-            "read-only fast-open commands need authority before the live pending-saga gate"
+            !should_acquire_startup_write_lock(true, false, true),
+            "read-only fast-open commands should try the current-schema database before joining the writer lock path"
         );
         assert!(
-            should_acquire_startup_write_lock(true, true, true),
-            "fast-open misses must not reach writable fallback without preexisting authority"
+            !should_acquire_startup_write_lock(true, true, true),
+            "fast-open misses acquire authority inside config before writable fallback"
         );
         assert!(
             should_acquire_startup_write_lock(false, true, false),
             "non-fast-open DB-family commands must keep the startup lock"
         );
+    }
+
+    #[test]
+    fn legacy_auto_migration_classifies_only_pre_reviewed_schema_mismatches() {
+        for found in [0, 4, 12] {
+            assert!(legacy_schema_can_auto_migrate(
+                &BeadsError::SchemaMismatch {
+                    expected: beads_rust::storage::schema::CURRENT_SCHEMA_VERSION,
+                    found,
+                }
+            ));
+        }
+        for found in [-1, 13, 18, 19, 20] {
+            assert!(!legacy_schema_can_auto_migrate(
+                &BeadsError::SchemaMismatch {
+                    expected: beads_rust::storage::schema::CURRENT_SCHEMA_VERSION,
+                    found,
+                }
+            ));
+        }
+        assert!(!legacy_schema_can_auto_migrate(&BeadsError::SyncConflict {
+            message: "unreadable database".to_string(),
+        }));
     }
 
     #[test]
@@ -2747,7 +2895,7 @@ mod tests {
         );
 
         assert!(
-            inspect_pending_sync_merge_for_no_db_write(&db_path, &authority)
+            inspect_pending_sync_merge_for_startup_under_authority(&db_path, &authority)
                 .unwrap()
                 .is_none(),
             "an exact missing DB cannot contain a pending receipt"
@@ -2764,6 +2912,23 @@ mod tests {
             "missing-DB classification must permit ordinary no-DB JSONL work"
         );
         assert!(!db_path.exists());
+    }
+
+    #[test]
+    fn startup_advisory_allows_exact_missing_database() {
+        let temp = TempDir::new().unwrap();
+        let db_path = temp.path().join("beads.db");
+
+        assert!(
+            inspect_pending_sync_merge_for_startup(&db_path)
+                .unwrap()
+                .is_none(),
+            "a JSONL-only checkout must be allowed to initialize its database"
+        );
+        assert!(
+            !db_path.exists(),
+            "advisory inspection must remain read-only"
+        );
     }
 
     #[test]
@@ -2792,9 +2957,10 @@ mod tests {
                 .unwrap(),
             );
 
-            let state = inspect_pending_sync_merge_for_no_db_write(&db_path, &authority)
-                .unwrap()
-                .expect("pending state must refuse no-DB writer");
+            let state =
+                inspect_pending_sync_merge_for_startup_under_authority(&db_path, &authority)
+                    .unwrap()
+                    .expect("pending state must refuse no-DB writer");
             let err = pending_sync_merge_no_db_refusal_error(&state);
 
             assert_eq!(state.condition_name(), expected_condition);
@@ -2927,6 +3093,17 @@ mod tests {
                 PendingMergeStartupDisposition::Refuse
             );
         }
+
+        let rename_prefix_import =
+            Cli::parse_from(["br", "sync", "--import-only", "--rename-prefix"]).command;
+        assert!(command_must_refuse_during_pending_merge(
+            &rename_prefix_import
+        ));
+        assert_eq!(
+            pending_merge_startup_disposition(&rename_prefix_import),
+            PendingMergeStartupDisposition::CommandOwnedRecovery,
+            "rename-prefix import must refuse real receipts while owning uninspectable recovery"
+        );
     }
 
     #[test]
@@ -3001,6 +3178,23 @@ mod tests {
                 PendingMergeStartupDisposition::ReadOnlyNoAutoSync,
                 "read-only command must disable automatic import/export while pending"
             );
+        }
+    }
+
+    #[test]
+    fn read_only_config_inspection_skips_live_pending_merge_storage_gate() {
+        for command in [
+            Cli::parse_from(["br", "config", "get", "issue_prefix"]).command,
+            Cli::parse_from(["br", "config", "list"]).command,
+        ] {
+            assert!(!command_requires_startup_pending_merge_inspection(&command));
+        }
+
+        for mutation in [
+            Cli::parse_from(["br", "config", "set", "issue_prefix=bd"]).command,
+            Cli::parse_from(["br", "config", "edit"]).command,
+        ] {
+            assert!(command_requires_startup_pending_merge_inspection(&mutation));
         }
     }
 
@@ -3371,13 +3565,13 @@ mod tests {
     }
 
     #[test]
-    fn preopen_storage_requires_write_lock_before_open() {
+    fn preopen_storage_requires_write_lock_unless_read_only_fast_open() {
         assert!(should_acquire_startup_write_lock(false, true, false));
         assert!(should_acquire_startup_write_lock(true, false, false));
         assert!(should_acquire_startup_write_lock(true, true, false));
         assert!(!should_acquire_startup_write_lock(false, false, false));
-        assert!(should_acquire_startup_write_lock(false, true, true));
-        assert!(should_acquire_startup_write_lock(true, false, true));
-        assert!(should_acquire_startup_write_lock(true, true, true));
+        assert!(!should_acquire_startup_write_lock(false, true, true));
+        assert!(!should_acquire_startup_write_lock(true, false, true));
+        assert!(!should_acquire_startup_write_lock(true, true, true));
     }
 }

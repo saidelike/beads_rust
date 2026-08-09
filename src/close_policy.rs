@@ -18,8 +18,10 @@
 //! intentionally out of scope.
 
 use crate::error::{BeadsError, Result};
+use crate::model::IssueType;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::Path;
 
@@ -54,6 +56,11 @@ pub struct PolicyDocument {
     /// section is absent the default is permissive (no enforcement), so
     /// existing repos are unaffected.
     pub workflow: Workflow,
+    /// Optional project-level issue-type capability registry.
+    ///
+    /// The registry affects derived tracker behavior only. Issue rows and
+    /// JSONL continue to store the original normalized type string.
+    pub issue_types: IssueTypePolicy,
     /// When `false`, the `--bypass-policy` CLI flag is rejected. Defaults to
     /// `true` so projects retain the standard escape hatch.
     #[serde(default = "default_true")]
@@ -65,6 +72,7 @@ impl Default for PolicyDocument {
         Self {
             close_policy: ClosePolicy::default(),
             workflow: Workflow::default(),
+            issue_types: IssueTypePolicy::default(),
             allow_bypass: default_true(),
         }
     }
@@ -72,6 +80,357 @@ impl Default for PolicyDocument {
 
 const fn default_true() -> bool {
     true
+}
+
+/// Optional project-level issue-type capability policy.
+///
+/// Profiles are applied in source order, followed by project definitions.
+/// A project definition with the same normalized name as a profile entry
+/// overrides only the explicitly supplied fields. Duplicate project
+/// definitions are rejected because source-order shadowing is too easy to
+/// miss in policy review.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct IssueTypePolicy {
+    /// Bundled profiles to enable.
+    pub profiles: Vec<String>,
+    /// Project-local definitions and overrides.
+    pub types: Vec<IssueTypeDefinition>,
+}
+
+/// One project-local issue-type definition.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IssueTypeDefinition {
+    /// Type name. Resolution is case-insensitive and whitespace-trimmed.
+    pub name: String,
+    /// Capability values to apply over the profile or neutral baseline.
+    #[serde(default)]
+    pub capabilities: IssueTypeCapabilityOverrides,
+    /// Optional presentation role used by composite roadmap views.
+    #[serde(default)]
+    pub roadmap_role: Option<RoadmapRole>,
+}
+
+/// Presentation classification for workflow roadmap views.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "kebab-case")]
+pub enum RoadmapRole {
+    Authority,
+    Decision,
+    Specification,
+    Implementation,
+}
+
+/// Optional capability values used by profiles and project overrides.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct IssueTypeCapabilityOverrides {
+    /// Treat the type as a container even when it currently has no children.
+    pub aggregate: Option<bool>,
+    /// Include open instances in ready-work selection when otherwise eligible.
+    pub ready_work: Option<bool>,
+    /// Treat non-terminal direct children as blockers on the parent.
+    pub blocked_by_open_children: Option<bool>,
+    /// Permit an ordinary close while direct children remain non-terminal.
+    pub may_close_with_open_children: Option<bool>,
+    /// Prefer the type as a governing inherited-context ancestor.
+    pub inherited_context_root: Option<bool>,
+}
+
+/// Effective behavior for one normalized issue type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct IssueTypeCapabilities {
+    pub aggregate: bool,
+    pub ready_work: bool,
+    pub blocked_by_open_children: bool,
+    pub may_close_with_open_children: bool,
+    pub inherited_context_root: bool,
+}
+
+impl Default for IssueTypeCapabilities {
+    fn default() -> Self {
+        Self::neutral()
+    }
+}
+
+impl IssueTypeCapabilities {
+    /// Behavior of an unregistered type.
+    #[must_use]
+    pub const fn neutral() -> Self {
+        Self {
+            aggregate: false,
+            ready_work: true,
+            blocked_by_open_children: false,
+            may_close_with_open_children: false,
+            inherited_context_root: false,
+        }
+    }
+
+    /// Current built-in Epic behavior.
+    #[must_use]
+    pub const fn epic() -> Self {
+        Self {
+            aggregate: true,
+            ready_work: true,
+            blocked_by_open_children: true,
+            may_close_with_open_children: false,
+            inherited_context_root: true,
+        }
+    }
+
+    fn apply(self, overrides: &IssueTypeCapabilityOverrides) -> Self {
+        Self {
+            aggregate: overrides.aggregate.unwrap_or(self.aggregate),
+            ready_work: overrides.ready_work.unwrap_or(self.ready_work),
+            blocked_by_open_children: overrides
+                .blocked_by_open_children
+                .unwrap_or(self.blocked_by_open_children),
+            may_close_with_open_children: overrides
+                .may_close_with_open_children
+                .unwrap_or(self.may_close_with_open_children),
+            inherited_context_root: overrides
+                .inherited_context_root
+                .unwrap_or(self.inherited_context_root),
+        }
+    }
+}
+
+impl Default for TypeCapabilityRegistry {
+    fn default() -> Self {
+        let mut types = BTreeMap::new();
+        types.insert(
+            "epic".to_string(),
+            EffectiveIssueType {
+                name: "epic".to_string(),
+                source: "builtin".to_string(),
+                capabilities: IssueTypeCapabilities::epic(),
+                roadmap_role: None,
+            },
+        );
+        Self {
+            standard_types: IssueType::STANDARD_NAMES
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+            accepts_custom_types: IssueType::ACCEPTS_CUSTOM_TYPES,
+            active_profiles: Vec::new(),
+            types,
+            type_order: vec!["epic".to_string()],
+        }
+    }
+}
+
+/// One effective registered type exposed through machine-readable contracts.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct EffectiveIssueType {
+    pub name: String,
+    pub source: String,
+    pub capabilities: IssueTypeCapabilities,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub roadmap_role: Option<RoadmapRole>,
+}
+
+/// Accepted issue-type syntax plus the resolved capability-registration map.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct TypeCapabilityRegistry {
+    /// Canonical standard names accepted as issue-type syntax.
+    ///
+    /// This is not an allowlist: custom names may also be accepted.
+    pub standard_types: Vec<String>,
+    /// Whether unregistered custom issue-type strings are accepted.
+    pub accepts_custom_types: bool,
+    /// Enabled profiles contributing capability registrations.
+    pub active_profiles: Vec<String>,
+    /// Effective behavior-bearing registrations, keyed by normalized name.
+    ///
+    /// Omission from this map means neutral capabilities, not invalid syntax.
+    pub types: BTreeMap<String, EffectiveIssueType>,
+    #[serde(skip)]
+    #[schemars(skip)]
+    type_order: Vec<String>,
+}
+
+impl TypeCapabilityRegistry {
+    /// Resolve project policy over built-in defaults.
+    ///
+    /// # Errors
+    ///
+    /// Returns a configuration error for blank/duplicate type names, duplicate
+    /// profiles, or unknown profiles.
+    pub fn resolve(policy: &IssueTypePolicy) -> Result<Self> {
+        let mut registry = Self::default();
+        let mut seen_profiles = BTreeSet::new();
+
+        for raw_profile in &policy.profiles {
+            let profile = normalize_type_name(raw_profile, "issue_types.profiles")?;
+            if !seen_profiles.insert(profile.clone()) {
+                return Err(BeadsError::Config(format!(
+                    "duplicate issue-type profile '{profile}' in issue_types.profiles"
+                )));
+            }
+            let definitions = bundled_issue_type_profile(&profile).ok_or_else(|| {
+                BeadsError::Config(format!(
+                    "unknown issue-type profile '{profile}' in issue_types.profiles"
+                ))
+            })?;
+            registry.active_profiles.push(profile.clone());
+            for (name, capabilities, roadmap_role) in definitions {
+                if !registry.type_order.iter().any(|existing| existing == name) {
+                    registry.type_order.push(name.to_string());
+                }
+                registry.types.insert(
+                    name.to_string(),
+                    EffectiveIssueType {
+                        name: name.to_string(),
+                        source: format!("profile:{profile}"),
+                        capabilities,
+                        roadmap_role,
+                    },
+                );
+            }
+        }
+
+        let mut seen_types = BTreeSet::new();
+        for definition in &policy.types {
+            let name = normalize_type_name(&definition.name, "issue_types.types[].name")?;
+            if !seen_types.insert(name.clone()) {
+                return Err(BeadsError::Config(format!(
+                    "duplicate issue-type definition '{name}' after normalization"
+                )));
+            }
+            if !registry.type_order.contains(&name) {
+                registry.type_order.push(name.clone());
+            }
+            let baseline = registry
+                .types
+                .get(&name)
+                .map_or_else(IssueTypeCapabilities::neutral, |entry| entry.capabilities);
+            let baseline_role = registry
+                .types
+                .get(&name)
+                .and_then(|entry| entry.roadmap_role);
+            registry.types.insert(
+                name.clone(),
+                EffectiveIssueType {
+                    name,
+                    source: "project".to_string(),
+                    capabilities: baseline.apply(&definition.capabilities),
+                    roadmap_role: definition.roadmap_role.or(baseline_role),
+                },
+            );
+        }
+
+        Ok(registry)
+    }
+
+    /// Registered issue types in deterministic configuration order.
+    #[must_use]
+    pub fn type_order(&self) -> Vec<String> {
+        if self.type_order.is_empty() {
+            self.types.keys().cloned().collect()
+        } else {
+            self.type_order.clone()
+        }
+    }
+
+    /// Effective capabilities for a normalized type name.
+    #[must_use]
+    pub fn capabilities_for_name(&self, issue_type: &str) -> IssueTypeCapabilities {
+        let normalized = issue_type.trim().to_lowercase();
+        self.types
+            .get(&normalized)
+            .map_or_else(IssueTypeCapabilities::neutral, |entry| entry.capabilities)
+    }
+
+    /// Effective roadmap role for a normalized type name.
+    #[must_use]
+    pub fn roadmap_role_for_name(&self, issue_type: &str) -> Option<RoadmapRole> {
+        self.types
+            .get(&issue_type.trim().to_lowercase())
+            .and_then(|entry| entry.roadmap_role)
+    }
+
+    /// Whether the normalized type is explicitly registered or built in.
+    #[must_use]
+    pub fn is_registered(&self, issue_type: &str) -> bool {
+        self.types.contains_key(&issue_type.trim().to_lowercase())
+    }
+
+    /// Whether this is the unconfigured built-in-only registry.
+    #[must_use]
+    pub fn is_builtin_only(&self) -> bool {
+        self.active_profiles.is_empty()
+            && self.types.len() == 1
+            && self.types.get("epic").is_some_and(|entry| {
+                entry.source == "builtin" && entry.capabilities == IssueTypeCapabilities::epic()
+            })
+    }
+}
+
+fn normalize_type_name(raw: &str, field: &str) -> Result<String> {
+    let normalized = raw.trim().to_lowercase();
+    if normalized.is_empty() {
+        return Err(BeadsError::Config(format!("{field} must not be empty")));
+    }
+    Ok(normalized)
+}
+
+fn bundled_issue_type_profile(
+    name: &str,
+) -> Option<Vec<(&'static str, IssueTypeCapabilities, Option<RoadmapRole>)>> {
+    match name {
+        // The core profile is intentionally observationally identical to the
+        // always-available built-in Epic defaults. It exercises the same
+        // profile/override composition path used by bundled workflow profiles
+        // without opting projects into new type names.
+        "core" => Some(vec![("epic", IssueTypeCapabilities::epic(), None)]),
+        "matt-skills" => Some(vec![
+            (
+                "map",
+                IssueTypeCapabilities {
+                    aggregate: true,
+                    ready_work: false,
+                    blocked_by_open_children: false,
+                    may_close_with_open_children: false,
+                    inherited_context_root: true,
+                },
+                Some(RoadmapRole::Authority),
+            ),
+            (
+                "research",
+                IssueTypeCapabilities::neutral(),
+                Some(RoadmapRole::Decision),
+            ),
+            (
+                "grilling",
+                IssueTypeCapabilities::neutral(),
+                Some(RoadmapRole::Decision),
+            ),
+            (
+                "prototype",
+                IssueTypeCapabilities::neutral(),
+                Some(RoadmapRole::Decision),
+            ),
+            (
+                "spec",
+                IssueTypeCapabilities {
+                    aggregate: true,
+                    ready_work: true,
+                    blocked_by_open_children: false,
+                    may_close_with_open_children: true,
+                    inherited_context_root: false,
+                },
+                Some(RoadmapRole::Specification),
+            ),
+            (
+                "implementation",
+                IssueTypeCapabilities::neutral(),
+                Some(RoadmapRole::Implementation),
+            ),
+        ]),
+        _ => None,
+    }
 }
 
 /// Close-time policy gates.
@@ -2647,6 +3006,7 @@ pub fn load_for_beads_dir(beads_dir: &Path) -> Result<PolicyDocument> {
     })?;
     document.workflow.validate_capacity()?;
     document.workflow.validate_required_fields()?;
+    TypeCapabilityRegistry::resolve(&document.issue_types)?;
 
     // Re-parse the raw YAML into a free-form value tree so we can diff it
     // against the typed schema and surface unknown fields without failing
@@ -2710,6 +3070,9 @@ enum PolicyNode {
     RequireTypedReferences,
     /// `workflow:` block (issue #311).
     Workflow,
+    /// `issue_types:` owns a strict typed schema and validates nested keys
+    /// during deserialization.
+    IssueTypes,
     /// `workflow.status_groups:` block (issue #354).
     StatusGroups,
     /// Terminal scalar / list — descent stops here.
@@ -2724,6 +3087,7 @@ impl PolicyNode {
             Self::Document => &[
                 ("close_policy", Self::ClosePolicy),
                 ("workflow", Self::Workflow),
+                ("issue_types", Self::IssueTypes),
                 ("allow_bypass", Self::Scalar),
             ],
             Self::ClosePolicy => &[
@@ -2762,6 +3126,11 @@ impl PolicyNode {
                 ("capacity", Self::Scalar),
             ],
             Self::StatusGroups => &[("ready", Self::Scalar)],
+            Self::IssueTypes => &[
+                ("profiles", Self::Scalar),
+                // Entries are strict typed values with deny_unknown_fields.
+                ("types", Self::Scalar),
+            ],
             Self::Scalar => &[],
         }
     }
@@ -3777,6 +4146,11 @@ close_policy:
             &field_names_of::<Workflow>(),
             "Workflow",
         );
+        assert_table_covers(
+            PolicyNode::IssueTypes,
+            &field_names_of::<IssueTypePolicy>(),
+            "IssueTypePolicy",
+        );
     }
 
     /// Inverse drift guard: every key listed in `PolicyNode::child_table()`
@@ -3853,6 +4227,226 @@ close_policy:
             &field_names_of::<Workflow>(),
             "Workflow",
         );
+        assert_no_stale(
+            PolicyNode::IssueTypes,
+            &field_names_of::<IssueTypePolicy>(),
+            "IssueTypePolicy",
+        );
+    }
+
+    #[test]
+    fn issue_type_registry_preserves_builtin_and_neutral_defaults() {
+        let registry = TypeCapabilityRegistry::default();
+        assert_eq!(
+            registry.standard_types,
+            IssueType::STANDARD_NAMES.map(str::to_string)
+        );
+        assert!(registry.accepts_custom_types);
+        assert_eq!(
+            registry.capabilities_for_name("Epic"),
+            IssueTypeCapabilities::epic()
+        );
+        assert_eq!(
+            registry.capabilities_for_name("Unregistered-Custom"),
+            IssueTypeCapabilities::neutral()
+        );
+        assert!(registry.is_registered("EPIC"));
+        assert!(registry.standard_types.iter().any(|name| name == "epic"));
+        assert!(!registry.is_registered("task"));
+        assert!(!registry.is_registered("unregistered-custom"));
+        assert!(registry.is_builtin_only());
+    }
+
+    #[test]
+    fn issue_type_registry_applies_profile_then_project_override() {
+        let policy = IssueTypePolicy {
+            profiles: vec![" Core ".to_string()],
+            types: vec![
+                IssueTypeDefinition {
+                    name: "EPIC".to_string(),
+                    capabilities: IssueTypeCapabilityOverrides {
+                        ready_work: Some(false),
+                        ..Default::default()
+                    },
+                    roadmap_role: None,
+                },
+                IssueTypeDefinition {
+                    name: "Map".to_string(),
+                    capabilities: IssueTypeCapabilityOverrides {
+                        aggregate: Some(true),
+                        inherited_context_root: Some(true),
+                        ..Default::default()
+                    },
+                    roadmap_role: None,
+                },
+            ],
+        };
+
+        let registry = TypeCapabilityRegistry::resolve(&policy).expect("valid registry");
+        let epic = registry.capabilities_for_name("epic");
+        assert!(epic.aggregate);
+        assert!(!epic.ready_work);
+        let map = registry.capabilities_for_name("map");
+        assert!(map.aggregate);
+        assert!(
+            map.ready_work,
+            "unspecified fields inherit neutral defaults"
+        );
+        assert!(map.inherited_context_root);
+        assert_eq!(
+            registry.roadmap_role_for_name("map"),
+            None,
+            "the core profile must not infer Matt-specific roadmap roles"
+        );
+        assert_eq!(registry.active_profiles, vec!["core"]);
+    }
+
+    #[test]
+    fn matt_skills_profile_registers_workflow_roles_and_accepts_overrides() {
+        let policy = IssueTypePolicy {
+            profiles: vec!["matt-skills".to_string()],
+            types: vec![IssueTypeDefinition {
+                name: "research".to_string(),
+                capabilities: IssueTypeCapabilityOverrides {
+                    ready_work: Some(false),
+                    ..Default::default()
+                },
+                roadmap_role: Some(RoadmapRole::Decision),
+            }],
+        };
+        let registry = TypeCapabilityRegistry::resolve(&policy).expect("valid Matt-skills profile");
+        assert_eq!(registry.active_profiles, vec!["matt-skills"]);
+        for name in [
+            "map",
+            "research",
+            "grilling",
+            "prototype",
+            "spec",
+            "implementation",
+        ] {
+            assert!(registry.is_registered(name), "missing profile type {name}");
+        }
+
+        let map = registry.capabilities_for_name("map");
+        assert!(map.aggregate);
+        assert!(!map.ready_work);
+        assert!(!map.blocked_by_open_children);
+        assert!(map.inherited_context_root);
+
+        let spec = registry.capabilities_for_name("spec");
+        assert!(spec.aggregate);
+        assert!(spec.ready_work);
+        assert!(spec.may_close_with_open_children);
+        assert_eq!(
+            registry.roadmap_role_for_name("spec"),
+            Some(RoadmapRole::Specification)
+        );
+
+        for name in ["grilling", "prototype", "implementation"] {
+            assert_eq!(
+                registry.capabilities_for_name(name),
+                IssueTypeCapabilities::neutral(),
+                "{name} remains leaf work by default"
+            );
+        }
+        assert_eq!(
+            registry.roadmap_role_for_name("research"),
+            Some(RoadmapRole::Decision)
+        );
+        assert_eq!(
+            registry.roadmap_role_for_name("implementation"),
+            Some(RoadmapRole::Implementation)
+        );
+        assert!(
+            !registry.capabilities_for_name("research").ready_work,
+            "project overrides apply after the bundled profile"
+        );
+        assert_eq!(
+            registry.capabilities_for_name("bug"),
+            IssueTypeCapabilities::neutral(),
+            "native Bug remains ordinary leaf work"
+        );
+    }
+
+    #[test]
+    fn issue_type_registry_rejects_duplicate_normalized_definitions() {
+        let policy = IssueTypePolicy {
+            types: vec![
+                IssueTypeDefinition {
+                    name: "Map".to_string(),
+                    capabilities: IssueTypeCapabilityOverrides::default(),
+                    roadmap_role: None,
+                },
+                IssueTypeDefinition {
+                    name: " map ".to_string(),
+                    capabilities: IssueTypeCapabilityOverrides::default(),
+                    roadmap_role: None,
+                },
+            ],
+            ..Default::default()
+        };
+
+        let error = TypeCapabilityRegistry::resolve(&policy).expect_err("duplicate must fail");
+        assert!(
+            error
+                .to_string()
+                .contains("duplicate issue-type definition 'map'")
+        );
+    }
+
+    #[test]
+    fn issue_type_registry_accepts_project_roadmap_role_overrides() {
+        let yaml = r"
+issue_types:
+  profiles: [matt-skills]
+  types:
+    - name: spec
+      roadmap_role: decision
+    - name: publication
+      roadmap_role: specification
+";
+        let document: PolicyDocument = serde_yml::from_str(yaml).expect("valid role policy");
+        let registry =
+            TypeCapabilityRegistry::resolve(&document.issue_types).expect("resolved role policy");
+        assert_eq!(
+            registry.roadmap_role_for_name("spec"),
+            Some(RoadmapRole::Decision)
+        );
+        assert_eq!(
+            registry.roadmap_role_for_name("publication"),
+            Some(RoadmapRole::Specification)
+        );
+        assert_eq!(
+            registry.capabilities_for_name("publication"),
+            IssueTypeCapabilities::neutral(),
+            "presentation roles do not change behavioral capabilities"
+        );
+    }
+
+    #[test]
+    fn issue_type_registry_rejects_unknown_profile_and_capability() {
+        let policy = IssueTypePolicy {
+            profiles: vec!["not-a-profile".to_string()],
+            ..Default::default()
+        };
+        assert!(
+            TypeCapabilityRegistry::resolve(&policy)
+                .expect_err("unknown profile must fail")
+                .to_string()
+                .contains("unknown issue-type profile 'not-a-profile'")
+        );
+
+        let yaml = r"
+issue_types:
+  types:
+    - name: map
+      capabilities:
+        ready_work: false
+        mysterious_power: true
+";
+        let error =
+            serde_yml::from_str::<PolicyDocument>(yaml).expect_err("unknown capability must fail");
+        assert!(error.to_string().contains("mysterious_power"));
     }
 
     // =========================================================================

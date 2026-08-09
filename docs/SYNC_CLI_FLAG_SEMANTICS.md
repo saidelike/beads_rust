@@ -331,6 +331,3 @@ FLAGS:
 None currently. All flags serve specific purposes.
 
 ---
-
-*Document authored by PurpleFox (claude-opus-4-5-20251101) on 2026-01-16*
-*Reference: beads_rust-0v1.1.4*

@@ -14,8 +14,8 @@ const GUIDE: &str = r#"br Agent Guide
 
 Purpose:
   br is a local-first issue tracker. It stores primary state in SQLite and
-  exports .beads/issues.jsonl for git-friendly handoff. Normal issue and sync
-  paths never run git. Only an explicit br vcs-status request runs bounded,
+  exports .beads/issues.jsonl for git-friendly handoff. Only an explicit br vcs-status request
+  may run Git; vcs-status runs only bounded,
   read-only Git probes.
 
 Machine-output defaults:

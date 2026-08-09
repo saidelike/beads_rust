@@ -15,7 +15,7 @@ mkdir -p "$target_dir"
 cd "$target_dir"
 
 "$tool_bin" init >/dev/null 2>&1
-"$tool_bin" sync --flush-only >/dev/null 2>&1
+"$tool_bin" sync --flush-only --force >/dev/null 2>&1
 
 # Avoid the pre-chokepoint .gitignore carveout adding unrelated noise during
 # --repair. The fixture is about accumulated run dirs, not gitignore repair.
@@ -42,4 +42,3 @@ if [ -e .fixture_baseline ]; then
 fi
 mkdir -p .fixture_baseline
 tar --exclude=.fixture_baseline -cf .fixture_baseline/state.tar .
-

@@ -232,7 +232,3 @@ The following dangerous operations require explicit user intent:
 | IV-3 | Input Validation | Validate issue ID prefix |
 
 ---
-
-*Document created by PurpleFox (claude-opus-4-5-20251101) on 2026-01-16*
-*Updated by BrightMesa (claude-opus-4-5-20251101) on 2026-01-16: Added risk prioritization*
-*Reference: beads_rust-0v1.1.2*

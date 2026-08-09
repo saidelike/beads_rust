@@ -8,7 +8,7 @@ use crate::error::{BeadsError, Result};
 use crate::model::{IssueType, Priority, Status};
 use crate::util::content_hash_from_parts;
 
-pub const CURRENT_SCHEMA_VERSION: i32 = 17;
+pub const CURRENT_SCHEMA_VERSION: i32 = 19;
 const ISSUES_CLOSED_AT_CHECK: &str = "CHECK ((status = 'closed' AND closed_at IS NOT NULL) OR (status = 'tombstone') OR (status NOT IN ('closed', 'tombstone') AND closed_at IS NULL))";
 const GATE_RESULT_HISTORY_MIGRATION_SQL: &str = r"
     CREATE TABLE IF NOT EXISTS gate_result_history (
@@ -38,6 +38,15 @@ struct ExpectedSchemaColumn {
     not_null: bool,
     default_value: Option<&'static str>,
     primary_key_position: i64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ExpectedSchemaIndex {
+    name: &'static str,
+    columns: &'static [&'static str],
+    unique: bool,
+    partial: bool,
+    partial_predicates: &'static [&'static str],
 }
 
 const GATE_RESULT_HISTORY_COLUMNS: &[ExpectedSchemaColumn] = &[
@@ -134,6 +143,86 @@ const GATE_RESULT_HISTORY_INDEXES: &[(&str, &[&str])] = &[
     ),
 ];
 
+const DEPENDENCY_INDEXES: &[ExpectedSchemaIndex] = &[
+    ExpectedSchemaIndex {
+        name: "idx_dependencies_issue",
+        columns: &["issue_id"],
+        unique: false,
+        partial: false,
+        partial_predicates: &[],
+    },
+    ExpectedSchemaIndex {
+        name: "idx_dependencies_depends_on",
+        columns: &["depends_on_id"],
+        unique: false,
+        partial: false,
+        partial_predicates: &[],
+    },
+    ExpectedSchemaIndex {
+        name: "idx_dependencies_type",
+        columns: &["type"],
+        unique: false,
+        partial: false,
+        partial_predicates: &[],
+    },
+    ExpectedSchemaIndex {
+        name: "idx_dependencies_depends_on_type",
+        columns: &["depends_on_id", "type"],
+        unique: false,
+        partial: false,
+        partial_predicates: &[],
+    },
+    ExpectedSchemaIndex {
+        name: "idx_dependencies_thread",
+        columns: &["thread_id"],
+        unique: false,
+        partial: true,
+        partial_predicates: &["thread_id != ''"],
+    },
+    ExpectedSchemaIndex {
+        name: "idx_dependencies_blocking",
+        columns: &["depends_on_id", "issue_id"],
+        unique: false,
+        partial: true,
+        partial_predicates: &[
+            "(type = 'blocks' OR type = 'parent-child' OR type = 'conditional-blocks' OR type = 'waits-for')",
+            "(type = 'blocks') OR (type = 'parent-child') OR (type = 'conditional-blocks') OR (type = 'waits-for')",
+        ],
+    },
+];
+
+const TEMPLATE_SEQUENCE_SCHEMA_SQL: &str = r"
+    CREATE TABLE id_counters (
+        name TEXT PRIMARY KEY,
+        next_value INTEGER NOT NULL DEFAULT 1
+    );
+    CREATE TABLE issue_sequences (
+        issue_id TEXT PRIMARY KEY,
+        sequence_number INTEGER NOT NULL CHECK(sequence_number > 0),
+        FOREIGN KEY (issue_id) REFERENCES issues(id) ON DELETE CASCADE
+    );
+    CREATE INDEX idx_issue_sequences_number
+        ON issue_sequences(sequence_number);
+";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DependencyIdentityLayout {
+    PairKeyed,
+    TypedKeyed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TemplateSequenceLayout {
+    Absent,
+    Canonical,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SchemaConvergenceLayout {
+    dependency_identity: DependencyIdentityLayout,
+    template_sequences: TemplateSequenceLayout,
+}
+
 const REQUIRED_RUNTIME_INDEXES: &[&str] = &[
     "idx_blocked_cache_blocked_at",
     "idx_close_metadata_bypassed",
@@ -171,6 +260,7 @@ const REQUIRED_RUNTIME_INDEXES: &[&str] = &[
     "idx_issues_status_priority_created",
     "idx_issues_tombstone",
     "idx_issues_updated_at",
+    "idx_issue_sequences_number",
     "idx_labels_issue",
     "idx_labels_label",
     "idx_metadata_key",
@@ -179,7 +269,7 @@ const REQUIRED_RUNTIME_INDEXES: &[&str] = &[
 /// Effects produced by one explicit reviewed schema migration.
 ///
 /// The reviewed migration surface is intentionally narrow: this binary only
-/// accepts schema 13 or 14 as input and always migrates to
+/// accepts every reviewed source from schema 13 through 18 and migrates to
 /// [`CURRENT_SCHEMA_VERSION`]. Callers use these counts to compare the
 /// transaction result with their reviewed plan.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -313,7 +403,7 @@ pub const SCHEMA_SQL: &str = r"
         created_by TEXT NOT NULL DEFAULT '',
         metadata TEXT DEFAULT '{}',
         thread_id TEXT DEFAULT '',
-        PRIMARY KEY (issue_id, depends_on_id),
+        PRIMARY KEY (issue_id, depends_on_id, type),
         FOREIGN KEY (issue_id) REFERENCES issues(id) ON DELETE CASCADE
         -- Note: depends_on_id FK intentionally removed to allow external issue references
     );
@@ -726,42 +816,17 @@ pub fn apply_schema(conn: &Connection) -> Result<()> {
     // so running migrations is unnecessary and harmful — e.g. the v3/v4
     // migrations DROP+CREATE idx_issues_ready which orphans a page and
     // causes doctor integrity warnings.
-    let is_fresh = !table_exists(conn, "issues");
-
-    // Run pre-schema migrations first to fix any incompatible old tables
-    // This must run BEFORE execute_batch because the batch includes CREATE INDEX
-    // statements that will fail if old tables have missing columns
-    let issues_rebuilt = run_pre_schema_migrations(conn).map_err(|e| {
-        eprintln!("run_pre_schema_migrations failed: {:?}", e);
-        e
-    })?;
-
-    execute_batch(conn, SCHEMA_SQL)?;
+    let is_fresh = !database_has_user_tables(conn)?;
 
     if is_fresh {
-        // Fresh database: SCHEMA_SQL already created everything at the
-        // current version. Skip migrations and stamp user_version directly.
-        conn.execute(&format!("PRAGMA user_version = {CURRENT_SCHEMA_VERSION}"))
-            .map_err(|e| {
-                eprintln!("PRAGMA user_version failed: {:?}", e);
-                BeadsError::Database(e)
-            })?;
+        execute_batch(conn, SCHEMA_SQL)?;
+        // Fresh databases start with canonical dependency identity from
+        // SCHEMA_SQL. Install the v19 template structures and stamp only after
+        // both physical postconditions attest successfully.
+        let source_layout = classify_schema_convergence_layout(conn)?;
+        converge_schema_v19_atomic(conn, source_layout)?;
     } else {
-        // Existing database: run migrations for schema upgrades.
-        // If the issues table was rebuilt from scratch, skip migration checks
-        // that reference newly-added columns because fsqlite's in-memory schema
-        // cache may not have been updated yet.
-        run_migrations(conn, issues_rebuilt).map_err(|e| {
-            eprintln!("run_migrations failed: {:?}", e);
-            e
-        })?;
-
-        // Mark schema as applied so future opens can skip DDL/migration work.
-        conn.execute(&format!("PRAGMA user_version = {CURRENT_SCHEMA_VERSION}"))
-            .map_err(|e| {
-                eprintln!("PRAGMA user_version failed: {:?}", e);
-                BeadsError::Database(e)
-            })?;
+        apply_existing_schema_atomic(conn)?;
     }
 
     apply_runtime_pragmas(conn).map_err(|e| {
@@ -791,6 +856,58 @@ pub fn apply_schema(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+fn apply_existing_schema_atomic(conn: &Connection) -> Result<()> {
+    let source_version = connection_user_version(conn)?;
+    let suppress_foreign_keys = table_exists(conn, "issues")
+        && (!issues_column_order_matches(conn)
+            || (source_version < 3 && issues_filter_columns_require_v3_rebuild(conn)));
+    if suppress_foreign_keys {
+        conn.execute("PRAGMA foreign_keys = OFF")?;
+    }
+
+    let result = (|| -> Result<()> {
+        conn.execute("BEGIN IMMEDIATE")?;
+        let result = (|| -> Result<()> {
+            let convergence_layout = if REVIEWED_MIGRATION_SOURCE_VERSIONS.contains(&source_version)
+                || source_version == current_schema_version_u32()?
+            {
+                Some(classify_schema_convergence_layout(conn)?)
+            } else {
+                None
+            };
+            let issues_rebuilt = run_pre_schema_migrations_in_transaction(conn).map_err(|e| {
+                eprintln!("run_pre_schema_migrations failed: {:?}", e);
+                e
+            })?;
+            execute_batch(conn, SCHEMA_SQL)?;
+            run_migrations_in_transaction(conn, issues_rebuilt, convergence_layout).map_err(|e| {
+                eprintln!("run_migrations failed: {:?}", e);
+                e
+            })
+        })();
+
+        match result {
+            Ok(()) => {
+                if let Err(error) = conn.execute("COMMIT") {
+                    let _ = conn.execute("ROLLBACK");
+                    return Err(BeadsError::Database(error));
+                }
+                Ok(())
+            }
+            Err(error) => {
+                let _ = conn.execute("ROLLBACK");
+                Err(error)
+            }
+        }
+    })();
+
+    if suppress_foreign_keys {
+        finish_foreign_key_suppressed_result(conn, "schema application", result)
+    } else {
+        result
+    }
+}
+
 fn connection_user_version(conn: &Connection) -> Result<u32> {
     let row = conn.query_row("PRAGMA user_version")?;
     Ok(row
@@ -805,10 +922,22 @@ fn connection_user_version(conn: &Connection) -> Result<u32> {
 /// Source schema versions accepted by the reviewed, receipt-bound
 /// `br doctor migrate-schema` lifecycle. Every released schema since v13 must
 /// stay upgradeable here: 13/14 (pre-gate-history releases), 15 (the #388
-/// gate-history schema shipped in the v0.2.19-era line) and 16 (the #384
-/// capacity-exemptions schema created by the released v0.2.19 binary). See
-/// GitHub #398.
-pub const REVIEWED_MIGRATION_SOURCE_VERSIONS: [u32; 4] = [13, 14, 15, 16];
+/// gate-history schema), 16 (the #384 capacity-exemptions schema), and 17
+/// (capacity occupancy), plus both structurally recognized v18 lineages.
+pub const REVIEWED_MIGRATION_SOURCE_VERSIONS: [u32; 6] = [13, 14, 15, 16, 17, 18];
+
+/// Whether a schema stamp predates the receipt-bound migration era.
+///
+/// Schemas before the first reviewed source version cannot contain a pending
+/// sync-merge receipt, so startup and doctor may safely defer their upgrade to
+/// the legacy authority-bound storage open. Negative, reviewed, current, and
+/// future versions never qualify.
+#[must_use]
+pub fn schema_version_predates_reviewed_migrations(version: i32) -> bool {
+    version >= 0
+        && u32::try_from(version)
+            .is_ok_and(|version| version < REVIEWED_MIGRATION_SOURCE_VERSIONS[0])
+}
 
 fn current_schema_version_u32() -> Result<u32> {
     u32::try_from(CURRENT_SCHEMA_VERSION).map_err(|_| {
@@ -834,7 +963,7 @@ fn validate_reviewed_schema_migration(
     if !REVIEWED_MIGRATION_SOURCE_VERSIONS.contains(&from) {
         return Err(BeadsError::internal(format!(
             "schema migrate refused — reviewed migrations are supported only from source \
-             schemas 13, 14, 15, and 16 to {supported_target} (got {from}->{target_version})"
+             schemas 13 through 18 to {supported_target} (got {from}->{target_version})"
         )));
     }
     if marked_at.is_empty() {
@@ -859,7 +988,7 @@ fn validate_reviewed_schema_migration(
 /// `BEGIN IMMEDIATE` transaction before calling it. All validation occurs
 /// before the first migration write.
 ///
-/// Sources in [`REVIEWED_MIGRATION_SOURCE_VERSIONS`] (13, 14, 15, 16) are
+/// Sources in [`REVIEWED_MIGRATION_SOURCE_VERSIONS`] (13 through 18) are
 /// accepted, each running exactly the version-gated step chain up to
 /// `CURRENT_SCHEMA_VERSION` (#398). `marked_at` is written verbatim to every
 /// `dirty_issues` row rewritten by the v13 content-hash step, making the
@@ -877,6 +1006,10 @@ pub fn run_reviewed_schema_migration_steps_in_transaction(
     marked_at: &str,
 ) -> Result<ReviewedSchemaMigrationEffects> {
     validate_reviewed_schema_migration(conn, from, target_version, marked_at)?;
+    // Inspect both colliding v18 lineages before any migration write. The
+    // caller's transaction guarantees that this physical-layout decision and
+    // the convergence steps observe one stable source.
+    let convergence_layout = classify_schema_convergence_layout(conn)?;
 
     let content_hash_rows_rebuilt = if from == 13 {
         tracing::info!("Migrating database to schema version 14 (length-prefixed content hashes)");
@@ -890,7 +1023,7 @@ pub fn run_reviewed_schema_migration_steps_in_transaction(
         tracing::info!("Migrating database to schema version 15 (transition-scoped gate history)");
         apply_gate_result_history_migration_in_transaction(conn)?;
     } else {
-        // A genuine v15/v16 database already carries the #388 gate-history
+        // A genuine v15-v17 database already carries the #388 gate-history
         // schema; attest it instead of re-running the migration so drift is
         // refused rather than silently papered over.
         attest_gate_result_history_schema(conn)?;
@@ -903,13 +1036,14 @@ pub fn run_reviewed_schema_migration_steps_in_transaction(
         apply_capacity_exemptions_migration_in_transaction(conn)?;
     }
 
-    tracing::info!(
-        "Migrating database to schema version 17 (capacity occupancy - GitHub #384 phase 5)"
-    );
-    apply_capacity_occupancy_migration_in_transaction(conn)?;
+    if from < 17 {
+        tracing::info!(
+            "Migrating database to schema version 17 (capacity occupancy - GitHub #384 phase 5)"
+        );
+        apply_capacity_occupancy_migration_in_transaction(conn)?;
+    }
 
-    conn.execute(&format!("PRAGMA user_version = {target_version}"))
-        .map_err(BeadsError::Database)?;
+    converge_schema_v19_in_transaction(conn, convergence_layout, target_version)?;
 
     let post = connection_user_version(conn)?;
     if post != target_version {
@@ -999,7 +1133,7 @@ pub fn run_migrations_atomic(conn: &Connection, from: u32, target_version: u32) 
         )));
     }
 
-    run_migrations(conn, false)?;
+    run_migrations(conn, false, None)?;
     conn.execute(&format!("PRAGMA user_version = {target_version}"))
         .map_err(BeadsError::Database)?;
 
@@ -1023,12 +1157,28 @@ pub fn run_migrations_atomic(conn: &Connection, from: u32, target_version: u32) 
 pub(crate) fn apply_runtime_compatible_schema(conn: &Connection) -> Result<()> {
     // The table layouts are already safe to operate on, so we can skip the
     // heavier pre-schema rebuilds and just restore any missing canonical DDL.
+    let source_layout = classify_schema_convergence_layout(conn)?;
     execute_batch(conn, SCHEMA_SQL)?;
-    run_migrations(conn, false)?;
-    conn.execute(&format!("PRAGMA user_version = {CURRENT_SCHEMA_VERSION}"))
-        .map_err(BeadsError::Database)?;
+    run_migrations(conn, false, Some(source_layout))?;
     apply_runtime_pragmas(conn)?;
     Ok(())
+}
+
+/// Restore canonical runtime DDL while the caller already owns a transaction.
+///
+/// Unlike [`apply_runtime_compatible_schema`], this helper deliberately does
+/// not run migrations: migration steps may open their own transactions, while
+/// callers such as `reset_data_tables` must keep the drop/recreate sequence
+/// atomic. The caller guarantees that the database is already at the current
+/// schema version; `SCHEMA_SQL` therefore supplies all required table and index
+/// definitions directly.
+///
+/// # Errors
+///
+/// Returns an error if canonical DDL or runtime pragmas cannot be restored.
+pub(crate) fn restore_runtime_schema_in_transaction(conn: &Connection) -> Result<()> {
+    execute_batch(conn, SCHEMA_SQL)?;
+    apply_runtime_pragmas(conn)
 }
 
 pub(crate) fn apply_runtime_pragmas(conn: &Connection) -> Result<()> {
@@ -1074,6 +1224,15 @@ pub(crate) fn table_exists(conn: &Connection, table: &str) -> bool {
     let escaped_table = table.replace('\'', "''");
     let sql = format!("SELECT 1 FROM sqlite_master WHERE type='table' AND name='{escaped_table}'");
     conn.query(&sql).is_ok_and(|rows| !rows.is_empty())
+}
+
+fn database_has_user_tables(conn: &Connection) -> Result<bool> {
+    let rows = conn.query("SELECT name FROM sqlite_master WHERE type='table'")?;
+    Ok(rows.iter().any(|row| {
+        row.get(0)
+            .and_then(SqliteValue::as_text)
+            .is_some_and(|name| !name.starts_with("sqlite_"))
+    }))
 }
 
 fn index_exists(conn: &Connection, index: &str) -> bool {
@@ -1233,7 +1392,7 @@ fn current_schema_version_declared(conn: &Connection) -> bool {
     conn.query_row("PRAGMA user_version")
         .ok()
         .and_then(|row| row.get(0).and_then(SqliteValue::as_integer))
-        .is_some_and(|version| version >= i64::from(CURRENT_SCHEMA_VERSION))
+        .is_some_and(|version| version == i64::from(CURRENT_SCHEMA_VERSION))
 }
 
 fn core_runtime_tables_exist(conn: &Connection) -> bool {
@@ -1435,6 +1594,20 @@ fn rebuild_issues_table(conn: &Connection) -> Result<()> {
     finish_foreign_key_suppressed_result(conn, "issues table rebuild", result)
 }
 
+fn rebuild_issues_table_in_transaction(conn: &Connection) -> Result<()> {
+    let existing_rows = conn.query("PRAGMA table_info('issues')")?;
+    let existing_columns: Vec<String> = existing_rows
+        .iter()
+        .filter_map(|row| row.get(1).and_then(SqliteValue::as_text).map(String::from))
+        .collect();
+
+    if existing_columns.is_empty() {
+        return Ok(());
+    }
+
+    rebuild_issues_table_inner(conn, &existing_columns)
+}
+
 /// Inner helper for [`rebuild_issues_table`] that performs the actual work
 /// inside an already-open transaction.
 fn rebuild_issues_table_inner(conn: &Connection, existing_columns: &[String]) -> Result<()> {
@@ -1615,37 +1788,22 @@ fn kv_table_needs_canonical_rebuild(conn: &Connection, table: &str, expected_ind
         && (!index_exists(conn, expected_index) || kv_table_uses_primary_key(conn, table))
 }
 
-fn rebuild_kv_table_without_unique(conn: &Connection, table: &str) -> Result<()> {
+fn rebuild_kv_table_without_unique_in_transaction(conn: &Connection, table: &str) -> Result<()> {
     let tmp_table = format!("{table}_rebuild_tmp");
-
-    conn.execute("BEGIN EXCLUSIVE")?;
-
-    let result = (|| -> Result<()> {
-        conn.execute(&format!("DROP TABLE IF EXISTS {tmp_table}"))?;
-        conn.execute(&format!(
-            "CREATE TABLE {tmp_table} (
-                key TEXT NOT NULL,
-                value TEXT NOT NULL
-            )"
-        ))?;
-
-        conn.execute(&format!(
-            "INSERT INTO {tmp_table} (key, value)
-             SELECT key, value
-             FROM {table}"
-        ))?;
-
-        conn.execute(&format!("DROP TABLE {table}"))?;
-        conn.execute(&format!("ALTER TABLE {tmp_table} RENAME TO {table}"))?;
-        Ok(())
-    })();
-
-    if let Err(err) = result {
-        let _ = conn.execute("ROLLBACK");
-        return Err(err);
-    }
-
-    conn.execute("COMMIT")?;
+    conn.execute(&format!("DROP TABLE IF EXISTS {tmp_table}"))?;
+    conn.execute(&format!(
+        "CREATE TABLE {tmp_table} (
+            key TEXT NOT NULL,
+            value TEXT NOT NULL
+        )"
+    ))?;
+    conn.execute(&format!(
+        "INSERT INTO {tmp_table} (key, value)
+         SELECT key, value
+         FROM {table}"
+    ))?;
+    conn.execute(&format!("DROP TABLE {table}"))?;
+    conn.execute(&format!("ALTER TABLE {tmp_table} RENAME TO {table}"))?;
     Ok(())
 }
 
@@ -1654,15 +1812,15 @@ fn rebuild_kv_table_without_unique(conn: &Connection, table: &str) -> Result<()>
 /// This must run BEFORE `execute_batch(SCHEMA_SQL)` because the schema includes
 /// CREATE INDEX statements that will fail if old tables have missing columns.
 /// Returns `true` if the issues table was rebuilt during pre-migrations.
-fn run_pre_schema_migrations(conn: &Connection) -> Result<bool> {
+fn run_pre_schema_migrations_in_transaction(conn: &Connection) -> Result<bool> {
     // Legacy schemas used PRIMARY KEY on config/metadata key columns.
     // Rebuild to plain key-value tables so standard sqlite integrity checks
     // are not tripped by unsupported unique-index maintenance behavior.
     if kv_table_needs_canonical_rebuild(conn, "config", "idx_config_key") {
-        rebuild_kv_table_without_unique(conn, "config")?;
+        rebuild_kv_table_without_unique_in_transaction(conn, "config")?;
     }
     if kv_table_needs_canonical_rebuild(conn, "metadata", "idx_metadata_key") {
-        rebuild_kv_table_without_unique(conn, "metadata")?;
+        rebuild_kv_table_without_unique_in_transaction(conn, "metadata")?;
     }
 
     // Drop blocked_issues_cache if it exists but is not canonical. The table is
@@ -1683,7 +1841,7 @@ fn run_pre_schema_migrations(conn: &Connection) -> Result<bool> {
     let issues_rebuilt = if issues_column_order_matches(conn) {
         false
     } else {
-        rebuild_issues_table(conn)?;
+        rebuild_issues_table_in_transaction(conn)?;
         true
     };
 
@@ -1713,10 +1871,14 @@ pub(crate) fn runtime_schema_compatible(conn: &Connection) -> bool {
     let version_ok = current_schema_version_declared(conn);
     let core_tables_ok = core_runtime_tables_exist(conn);
     let issues_ok = issues_column_order_matches(conn);
-    let dependencies_ok = table_has_columns(conn, "dependencies", &["issue_id", "depends_on_id"])
-        && DEPENDENCY_COLUMNS
-            .iter()
-            .all(|(name, _)| column_exists(conn, "dependencies", name));
+    let dependencies_ok =
+        matches!(
+            classify_dependency_identity(conn),
+            Ok(DependencyIdentityLayout::TypedKeyed)
+        ) && table_has_columns(conn, "dependencies", &["issue_id", "depends_on_id"])
+            && DEPENDENCY_COLUMNS
+                .iter()
+                .all(|(name, _)| column_exists(conn, "dependencies", name));
     let labels_ok = table_has_columns(conn, "labels", &["issue_id", "label"]);
     let comments_ok = table_has_columns(conn, "comments", &["id", "issue_id"])
         && COMMENT_COLUMNS
@@ -1740,6 +1902,7 @@ pub(crate) fn runtime_schema_compatible(conn: &Connection) -> bool {
     );
     let blocked_cache_ok = blocked_cache_table_canonical(conn);
     let child_counters_ok = table_has_columns(conn, "child_counters", &["parent_id", "last_child"]);
+    let template_sequences_ok = attest_template_sequence_schema(conn).is_ok();
     let gate_history_ok = attest_gate_result_history_schema(conn).is_ok();
     // v16/v17 capacity tables (#384). Checking them here means a database
     // stamped at the current version but missing these tables (e.g. one
@@ -1776,6 +1939,7 @@ pub(crate) fn runtime_schema_compatible(conn: &Connection) -> bool {
         && export_hashes_ok
         && blocked_cache_ok
         && child_counters_ok
+        && template_sequences_ok
         && gate_history_ok
         && capacity_ok
         && indexes_ok;
@@ -1795,6 +1959,7 @@ pub(crate) fn runtime_schema_compatible(conn: &Connection) -> bool {
             export_hashes_ok,
             blocked_cache_ok,
             child_counters_ok,
+            template_sequences_ok,
             gate_history_ok,
             capacity_ok,
             indexes_ok,
@@ -1809,15 +1974,42 @@ pub(crate) fn runtime_schema_compatible(conn: &Connection) -> bool {
 ///
 /// This handles upgrades for tables that may have been created with older schemas.
 #[allow(clippy::too_many_lines)]
-fn run_migrations(conn: &Connection, issues_rebuilt: bool) -> Result<()> {
+fn run_migrations(
+    conn: &Connection,
+    issues_rebuilt: bool,
+    preclassified_convergence_layout: Option<SchemaConvergenceLayout>,
+) -> Result<()> {
+    run_migrations_impl(
+        conn,
+        issues_rebuilt,
+        preclassified_convergence_layout,
+        false,
+    )
+}
+
+fn run_migrations_in_transaction(
+    conn: &Connection,
+    issues_rebuilt: bool,
+    preclassified_convergence_layout: Option<SchemaConvergenceLayout>,
+) -> Result<()> {
+    run_migrations_impl(conn, issues_rebuilt, preclassified_convergence_layout, true)
+}
+
+#[allow(clippy::too_many_lines)]
+fn run_migrations_impl(
+    conn: &Connection,
+    issues_rebuilt: bool,
+    preclassified_convergence_layout: Option<SchemaConvergenceLayout>,
+    in_transaction: bool,
+) -> Result<()> {
     // Migration: ensure blocked_issues_cache has the canonical derived-cache
     // schema, including NOT NULL payload columns. Older br/bd paths could
     // leave a nullable blocked_by column with stale NULL cache rows.
     if !blocked_cache_table_canonical(conn) {
-        // Table needs update - drop and recreate (it's a cache, data is regenerated)
-        // Wrap in transaction so concurrent opens don't see a partially migrated state
-        conn.execute("BEGIN IMMEDIATE")?;
         let result = (|| -> Result<()> {
+            if !in_transaction {
+                conn.execute("BEGIN IMMEDIATE")?;
+            }
             conn.execute("DROP TABLE IF EXISTS blocked_issues_cache")?;
             conn.execute(
                 "CREATE TABLE blocked_issues_cache (
@@ -1834,10 +2026,14 @@ fn run_migrations(conn: &Connection, issues_rebuilt: bool) -> Result<()> {
         })();
 
         if let Err(e) = result {
-            let _ = conn.execute("ROLLBACK");
+            if !in_transaction {
+                let _ = conn.execute("ROLLBACK");
+            }
             return Err(e);
         }
-        conn.execute("COMMIT")?;
+        if !in_transaction {
+            conn.execute("COMMIT")?;
+        }
     }
 
     // Migration: ensure compaction_level is never NULL (bd compatibility)
@@ -1870,7 +2066,11 @@ fn run_migrations(conn: &Connection, issues_rebuilt: bool) -> Result<()> {
             conn.execute("UPDATE issues SET is_template = 0 WHERE is_template IS NULL")?;
 
             // 2. Rebuild the table to apply NOT NULL constraints
-            rebuild_issues_table(conn)?;
+            if in_transaction {
+                rebuild_issues_table_in_transaction(conn)?;
+            } else {
+                rebuild_issues_table(conn)?;
+            }
 
             // 3. Recreate the optimized ready index
             conn.execute("DROP INDEX IF EXISTS idx_issues_ready")?;
@@ -1940,7 +2140,11 @@ fn run_migrations(conn: &Connection, issues_rebuilt: bool) -> Result<()> {
     // algorithm, so the next flush must rewrite JSONL tracking metadata.
     if user_version < 7 && table_exists(conn, "issues") {
         tracing::info!("Migrating database to schema version 7 (content hashes)");
-        rebuild_content_hashes_for_current_format(conn)?;
+        if in_transaction {
+            rebuild_content_hashes_for_current_format_in_open_transaction(conn)?;
+        } else {
+            rebuild_content_hashes_for_current_format(conn)?;
+        }
     }
 
     // v9: Add close_metadata table for closure-time policy gates (issue #274).
@@ -2089,7 +2293,11 @@ fn run_migrations(conn: &Connection, issues_rebuilt: bool) -> Result<()> {
     // to refresh on the next flush.
     if (7..14).contains(&user_version) && table_exists(conn, "issues") {
         tracing::info!("Migrating database to schema version 14 (length-prefixed content hashes)");
-        rebuild_content_hashes_for_current_format(conn)?;
+        if in_transaction {
+            rebuild_content_hashes_for_current_format_in_open_transaction(conn)?;
+        } else {
+            rebuild_content_hashes_for_current_format(conn)?;
+        }
     }
 
     // v15 (GitHub #388): preserve every workflow-gate verdict in an
@@ -2121,6 +2329,25 @@ fn run_migrations(conn: &Connection, issues_rebuilt: bool) -> Result<()> {
             "Migrating database to schema version 17 (capacity occupancy - GitHub #384 phase 5)"
         );
         apply_capacity_occupancy_migration_in_transaction(conn)?;
+    }
+
+    // v18 was independently allocated to two physical layouts: upstream used
+    // typed dependency identity while the fork used templated issue sequences.
+    // Converge from the observed structures rather than trusting the scalar.
+    // The shared step attests both structures and stamps v19 atomically.
+    if user_version < i64::from(REVIEWED_MIGRATION_SOURCE_VERSIONS[0])
+        && preclassified_convergence_layout.is_none()
+    {
+        repair_pre_reviewed_dependency_schema(conn)?;
+    }
+    let source_layout = match preclassified_convergence_layout {
+        Some(layout) => layout,
+        None => classify_schema_convergence_layout(conn)?,
+    };
+    if in_transaction {
+        converge_schema_v19_in_transaction(conn, source_layout, current_schema_version_u32()?)?;
+    } else {
+        converge_schema_v19_atomic(conn, source_layout)?;
     }
 
     // Migration: Add missing indexes for bd parity
@@ -2292,6 +2519,476 @@ fn sql_default_matches(actual: Option<&str>, expected: Option<&str>) -> bool {
     }
 }
 
+fn schema_convergence_error(detail: impl std::fmt::Display) -> BeadsError {
+    BeadsError::internal(format!("schema v19 convergence refused — {detail}"))
+}
+
+fn normalize_schema_sql(sql: &str) -> String {
+    let mut normalized = String::with_capacity(sql.len());
+    let mut in_string = false;
+    for character in sql.chars() {
+        if character == '\'' {
+            in_string = !in_string;
+            normalized.push(character);
+        } else if in_string {
+            normalized.push(character);
+        } else if !character.is_whitespace() {
+            normalized.push(character.to_ascii_lowercase());
+        }
+    }
+    normalized.trim_end_matches(';').to_string()
+}
+
+fn attest_dependency_indexes(conn: &Connection) -> Result<()> {
+    let index_rows = conn.query("PRAGMA index_list('dependencies')")?;
+    for expected in DEPENDENCY_INDEXES {
+        let index_row = index_rows
+            .iter()
+            .find(|row| row.get(1).and_then(SqliteValue::as_text) == Some(expected.name))
+            .ok_or_else(|| {
+                schema_convergence_error(format!("missing dependency index {}", expected.name))
+            })?;
+        let unique = index_row.get(2).and_then(SqliteValue::as_integer);
+        let origin = index_row.get(3).and_then(SqliteValue::as_text);
+        let partial = index_row.get(4).and_then(SqliteValue::as_integer);
+        let expected_unique = i64::from(expected.unique);
+        if unique != Some(expected_unique)
+            || !origin.is_some_and(|value| value.eq_ignore_ascii_case("c"))
+            || !matches!(partial, Some(0 | 1))
+        {
+            return Err(schema_convergence_error(format!(
+                "dependency index {} has non-canonical flags \
+                 (unique={unique:?}, origin={origin:?}, partial={partial:?})",
+                expected.name
+            )));
+        }
+
+        let escaped_name = expected.name.replace('\'', "''");
+        let columns = conn.query(&format!("PRAGMA index_info('{escaped_name}')"))?;
+        if columns.len() != expected.columns.len() {
+            return Err(schema_convergence_error(format!(
+                "dependency index {} has {} columns, expected {}",
+                expected.name,
+                columns.len(),
+                expected.columns.len()
+            )));
+        }
+        for (position, (row, expected_column)) in columns.iter().zip(expected.columns).enumerate() {
+            let expected_position = i64::try_from(position).map_err(|_| {
+                schema_convergence_error(format!(
+                    "dependency index {} position does not fit i64",
+                    expected.name
+                ))
+            })?;
+            let sequence = row.get(0).and_then(SqliteValue::as_integer);
+            let column = row.get(2).and_then(SqliteValue::as_text);
+            if sequence != Some(expected_position) || column != Some(*expected_column) {
+                return Err(schema_convergence_error(format!(
+                    "dependency index {} column {position} is not canonical \
+                     (seq={sequence:?}, name={column:?}, expected={expected_column:?})",
+                    expected.name
+                )));
+            }
+        }
+
+        let sql_rows = conn.query(&format!(
+            "SELECT sql FROM sqlite_master WHERE type='index' AND name='{escaped_name}'"
+        ))?;
+        let defining_sql = sql_rows
+            .first()
+            .and_then(|row| row.get(0))
+            .and_then(SqliteValue::as_text)
+            .ok_or_else(|| {
+                schema_convergence_error(format!(
+                    "dependency index {} has no defining SQL",
+                    expected.name
+                ))
+            })?;
+        let normalized_sql = normalize_schema_sql(defining_sql);
+        let observed_predicate = normalized_sql
+            .split_once("where")
+            .map(|(_, predicate)| predicate);
+        let expected_predicates: Vec<String> = expected
+            .partial_predicates
+            .iter()
+            .map(|predicate| normalize_schema_sql(predicate))
+            .collect();
+        // fsqlite currently reports `partial=0` from PRAGMA index_list even
+        // for indexes whose defining SQL contains a WHERE clause. Treat the
+        // persisted sqlite_master definition as authoritative for partial
+        // structure while still requiring a well-formed numeric PRAGMA flag.
+        let predicate_matches = observed_predicate.map_or_else(
+            || expected_predicates.is_empty(),
+            |predicate| {
+                expected_predicates
+                    .iter()
+                    .any(|expected| expected == predicate)
+            },
+        );
+        if observed_predicate.is_some() != expected.partial || !predicate_matches {
+            return Err(schema_convergence_error(format!(
+                "dependency index {} has non-canonical partial predicate \
+                 (observed={observed_predicate:?}, expected={expected_predicates:?})",
+                expected.name,
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn expected_dependency_columns(layout: DependencyIdentityLayout) -> [ExpectedSchemaColumn; 7] {
+    let type_primary_key_position = match layout {
+        DependencyIdentityLayout::PairKeyed => 0,
+        DependencyIdentityLayout::TypedKeyed => 3,
+    };
+    [
+        ExpectedSchemaColumn {
+            name: "issue_id",
+            data_type: "TEXT",
+            not_null: true,
+            default_value: None,
+            primary_key_position: 1,
+        },
+        ExpectedSchemaColumn {
+            name: "depends_on_id",
+            data_type: "TEXT",
+            not_null: true,
+            default_value: None,
+            primary_key_position: 2,
+        },
+        ExpectedSchemaColumn {
+            name: "type",
+            data_type: "TEXT",
+            not_null: true,
+            default_value: Some("'blocks'"),
+            primary_key_position: type_primary_key_position,
+        },
+        ExpectedSchemaColumn {
+            name: "created_at",
+            data_type: "DATETIME",
+            not_null: true,
+            default_value: Some("CURRENT_TIMESTAMP"),
+            primary_key_position: 0,
+        },
+        ExpectedSchemaColumn {
+            name: "created_by",
+            data_type: "TEXT",
+            not_null: true,
+            default_value: Some("''"),
+            primary_key_position: 0,
+        },
+        ExpectedSchemaColumn {
+            name: "metadata",
+            data_type: "TEXT",
+            not_null: false,
+            default_value: Some("'{}'"),
+            primary_key_position: 0,
+        },
+        ExpectedSchemaColumn {
+            name: "thread_id",
+            data_type: "TEXT",
+            not_null: false,
+            default_value: Some("''"),
+            primary_key_position: 0,
+        },
+    ]
+}
+
+fn attest_dependency_table_schema(
+    conn: &Connection,
+    layout: DependencyIdentityLayout,
+) -> Result<()> {
+    let expected_columns = expected_dependency_columns(layout);
+    attest_exact_columns(conn, "dependencies", &expected_columns)?;
+
+    let foreign_keys = conn.query("PRAGMA foreign_key_list('dependencies')")?;
+    if foreign_keys.len() != 1 {
+        return Err(schema_convergence_error(format!(
+            "dependencies has {} foreign keys, expected 1",
+            foreign_keys.len()
+        )));
+    }
+    let foreign_key = &foreign_keys[0];
+    let foreign_key_ok = foreign_key.get(0).and_then(SqliteValue::as_integer) == Some(0)
+        && foreign_key.get(1).and_then(SqliteValue::as_integer) == Some(0)
+        && foreign_key.get(2).and_then(SqliteValue::as_text) == Some("issues")
+        && foreign_key.get(3).and_then(SqliteValue::as_text) == Some("issue_id")
+        && foreign_key.get(4).and_then(SqliteValue::as_text) == Some("id")
+        && foreign_key
+            .get(5)
+            .and_then(SqliteValue::as_text)
+            .is_some_and(|value| value.eq_ignore_ascii_case("NO ACTION"))
+        && foreign_key
+            .get(6)
+            .and_then(SqliteValue::as_text)
+            .is_some_and(|value| value.eq_ignore_ascii_case("CASCADE"))
+        && foreign_key
+            .get(7)
+            .and_then(SqliteValue::as_text)
+            .is_some_and(|value| value.eq_ignore_ascii_case("NONE"));
+    if !foreign_key_ok {
+        return Err(schema_convergence_error(
+            "dependencies has a non-canonical foreign key",
+        ));
+    }
+
+    Ok(())
+}
+
+fn classify_dependency_primary_key(conn: &Connection) -> Result<DependencyIdentityLayout> {
+    let rows = conn.query("PRAGMA table_info('dependencies')")?;
+    if rows.is_empty() {
+        return Err(schema_convergence_error(
+            "dependencies table is absent or unreadable",
+        ));
+    }
+
+    let mut issue_id_pk = None;
+    let mut depends_on_id_pk = None;
+    let mut type_pk = None;
+    let mut unexpected_primary_key = None;
+
+    for row in &rows {
+        let name = row
+            .get(1)
+            .and_then(SqliteValue::as_text)
+            .ok_or_else(|| schema_convergence_error("dependencies contains an unnamed column"))?;
+        let primary_key_position =
+            row.get(5)
+                .and_then(SqliteValue::as_integer)
+                .ok_or_else(|| {
+                    schema_convergence_error(format!(
+                        "dependencies.{name} has no primary-key position"
+                    ))
+                })?;
+
+        match name {
+            "issue_id" => issue_id_pk = Some(primary_key_position),
+            "depends_on_id" => depends_on_id_pk = Some(primary_key_position),
+            "type" => type_pk = Some(primary_key_position),
+            _ if primary_key_position != 0 => {
+                unexpected_primary_key = Some((name.to_owned(), primary_key_position));
+            }
+            _ => {}
+        }
+    }
+
+    if let Some((name, position)) = unexpected_primary_key {
+        return Err(schema_convergence_error(format!(
+            "dependencies has unexpected primary-key column {name} at position {position}"
+        )));
+    }
+
+    match (issue_id_pk, depends_on_id_pk, type_pk) {
+        (Some(1), Some(2), Some(0)) => Ok(DependencyIdentityLayout::PairKeyed),
+        (Some(1), Some(2), Some(3)) => Ok(DependencyIdentityLayout::TypedKeyed),
+        observed => Err(schema_convergence_error(format!(
+            "dependencies primary key is malformed; expected \
+                 (issue_id=1, depends_on_id=2, type=0 or 3), observed {observed:?}"
+        ))),
+    }
+}
+
+fn classify_dependency_identity(conn: &Connection) -> Result<DependencyIdentityLayout> {
+    let layout = classify_dependency_primary_key(conn)?;
+
+    attest_dependency_table_schema(conn, layout)?;
+    if layout == DependencyIdentityLayout::TypedKeyed {
+        attest_dependency_indexes(conn)?;
+    }
+    Ok(layout)
+}
+
+fn repair_pre_reviewed_dependency_schema(conn: &Connection) -> Result<()> {
+    if !table_exists(conn, "dependencies") {
+        return Ok(());
+    }
+
+    ensure_columns(conn, "dependencies", DEPENDENCY_COLUMNS)?;
+    let _ = classify_dependency_primary_key(conn)?;
+    if classify_dependency_identity(conn).is_err() {
+        apply_typed_dependency_identity_migration(conn)?;
+    }
+    Ok(())
+}
+
+fn attest_exact_columns(
+    conn: &Connection,
+    table: &str,
+    expected: &[ExpectedSchemaColumn],
+) -> Result<()> {
+    let rows = conn.query(&format!("PRAGMA table_info('{table}')"))?;
+    if rows.len() != expected.len() {
+        return Err(schema_convergence_error(format!(
+            "{table} has {} columns, expected {}",
+            rows.len(),
+            expected.len()
+        )));
+    }
+
+    for (position, (row, expected_column)) in rows.iter().zip(expected).enumerate() {
+        let name = row.get(1).and_then(SqliteValue::as_text);
+        let data_type = row.get(2).and_then(SqliteValue::as_text);
+        let not_null = row.get(3).and_then(SqliteValue::as_integer);
+        let default_value = row.get(4).and_then(SqliteValue::as_text);
+        let primary_key_position = row.get(5).and_then(SqliteValue::as_integer);
+        if name != Some(expected_column.name)
+            || !data_type.is_some_and(|value| value.eq_ignore_ascii_case(expected_column.data_type))
+            || not_null != Some(i64::from(expected_column.not_null))
+            || !sql_default_matches(default_value, expected_column.default_value)
+            || primary_key_position != Some(expected_column.primary_key_position)
+        {
+            return Err(schema_convergence_error(format!(
+                "{table} column {position} is not canonical \
+                 (name={name:?}, type={data_type:?}, not_null={not_null:?}, \
+                 default={default_value:?}, pk={primary_key_position:?})"
+            )));
+        }
+    }
+
+    Ok(())
+}
+
+// Keep the complete template-schema invariant visible as one atomic attestation.
+#[allow(clippy::too_many_lines)]
+fn attest_template_sequence_schema(conn: &Connection) -> Result<()> {
+    const ID_COUNTER_COLUMNS: &[ExpectedSchemaColumn] = &[
+        ExpectedSchemaColumn {
+            name: "name",
+            data_type: "TEXT",
+            not_null: false,
+            default_value: None,
+            primary_key_position: 1,
+        },
+        ExpectedSchemaColumn {
+            name: "next_value",
+            data_type: "INTEGER",
+            not_null: true,
+            default_value: Some("1"),
+            primary_key_position: 0,
+        },
+    ];
+    const ISSUE_SEQUENCE_COLUMNS: &[ExpectedSchemaColumn] = &[
+        ExpectedSchemaColumn {
+            name: "issue_id",
+            data_type: "TEXT",
+            not_null: false,
+            default_value: None,
+            primary_key_position: 1,
+        },
+        ExpectedSchemaColumn {
+            name: "sequence_number",
+            data_type: "INTEGER",
+            not_null: true,
+            default_value: None,
+            primary_key_position: 0,
+        },
+    ];
+
+    attest_exact_columns(conn, "id_counters", ID_COUNTER_COLUMNS)?;
+    attest_exact_columns(conn, "issue_sequences", ISSUE_SEQUENCE_COLUMNS)?;
+
+    let foreign_keys = conn.query("PRAGMA foreign_key_list('issue_sequences')")?;
+    if foreign_keys.len() != 1 {
+        return Err(schema_convergence_error(format!(
+            "template table issue_sequences has {} foreign keys, expected 1",
+            foreign_keys.len()
+        )));
+    }
+    let foreign_key = &foreign_keys[0];
+    let foreign_key_ok = foreign_key.get(1).and_then(SqliteValue::as_integer) == Some(0)
+        && foreign_key.get(2).and_then(SqliteValue::as_text) == Some("issues")
+        && foreign_key.get(3).and_then(SqliteValue::as_text) == Some("issue_id")
+        && foreign_key.get(4).and_then(SqliteValue::as_text) == Some("id")
+        && foreign_key
+            .get(5)
+            .and_then(SqliteValue::as_text)
+            .is_some_and(|value| value.eq_ignore_ascii_case("NO ACTION"))
+        && foreign_key
+            .get(6)
+            .and_then(SqliteValue::as_text)
+            .is_some_and(|value| value.eq_ignore_ascii_case("CASCADE"));
+    if !foreign_key_ok {
+        return Err(schema_convergence_error(
+            "template table issue_sequences has a non-canonical foreign key",
+        ));
+    }
+
+    let table_rows = conn.query(
+        "SELECT sql FROM sqlite_master \
+         WHERE type='table' AND name='issue_sequences'",
+    )?;
+    let table_sql = table_rows
+        .first()
+        .and_then(|row| row.get(0))
+        .and_then(SqliteValue::as_text)
+        .ok_or_else(|| {
+            schema_convergence_error("template table issue_sequences has no defining SQL")
+        })?;
+    let normalized_sql: String = table_sql
+        .to_ascii_lowercase()
+        .chars()
+        .filter(|character| !character.is_whitespace())
+        .collect();
+    if !normalized_sql.contains("check(sequence_number>0)") {
+        return Err(schema_convergence_error(
+            "template table issue_sequences is missing CHECK(sequence_number > 0)",
+        ));
+    }
+
+    let index_rows = conn.query("PRAGMA index_list('issue_sequences')")?;
+    let index = index_rows
+        .iter()
+        .find(|row| row.get(1).and_then(SqliteValue::as_text) == Some("idx_issue_sequences_number"))
+        .ok_or_else(|| schema_convergence_error("missing idx_issue_sequences_number"))?;
+    if index.get(2).and_then(SqliteValue::as_integer) != Some(0)
+        || !index
+            .get(3)
+            .and_then(SqliteValue::as_text)
+            .is_some_and(|value| value.eq_ignore_ascii_case("c"))
+        || index.get(4).and_then(SqliteValue::as_integer) != Some(0)
+    {
+        return Err(schema_convergence_error(
+            "idx_issue_sequences_number is not a canonical non-unique, non-partial index",
+        ));
+    }
+    let index_columns = conn.query("PRAGMA index_info('idx_issue_sequences_number')")?;
+    if index_columns.len() != 1
+        || index_columns[0].get(0).and_then(SqliteValue::as_integer) != Some(0)
+        || index_columns[0].get(2).and_then(SqliteValue::as_text) != Some("sequence_number")
+    {
+        return Err(schema_convergence_error(
+            "idx_issue_sequences_number does not index only sequence_number",
+        ));
+    }
+
+    Ok(())
+}
+
+fn classify_template_sequences(conn: &Connection) -> Result<TemplateSequenceLayout> {
+    let id_counters_exists = table_exists(conn, "id_counters");
+    let issue_sequences_exists = table_exists(conn, "issue_sequences");
+    match (id_counters_exists, issue_sequences_exists) {
+        (false, false) => Ok(TemplateSequenceLayout::Absent),
+        (true, true) => {
+            attest_template_sequence_schema(conn)?;
+            Ok(TemplateSequenceLayout::Canonical)
+        }
+        observed => Err(schema_convergence_error(format!(
+            "template sequence layout is partial \
+             (id_counters={}, issue_sequences={})",
+            observed.0, observed.1
+        ))),
+    }
+}
+
+fn classify_schema_convergence_layout(conn: &Connection) -> Result<SchemaConvergenceLayout> {
+    Ok(SchemaConvergenceLayout {
+        dependency_identity: classify_dependency_identity(conn)?,
+        template_sequences: classify_template_sequences(conn)?,
+    })
+}
+
 fn attest_gate_result_history_columns(conn: &Connection) -> Result<()> {
     let rows = conn.query("PRAGMA table_info('gate_result_history')")?;
     if rows.len() != GATE_RESULT_HISTORY_COLUMNS.len() {
@@ -2446,6 +3143,134 @@ fn attest_gate_result_history_schema(conn: &Connection) -> Result<()> {
 fn apply_gate_result_history_migration_in_transaction(conn: &Connection) -> Result<()> {
     execute_batch(conn, GATE_RESULT_HISTORY_MIGRATION_SQL)?;
     attest_gate_result_history_schema(conn)
+}
+
+fn apply_typed_dependency_identity_migration(conn: &Connection) -> Result<()> {
+    let type_expression = if column_exists(conn, "dependencies", "type") {
+        "COALESCE(type, 'blocks')"
+    } else {
+        "'blocks'"
+    };
+    let created_at_expression = if column_exists(conn, "dependencies", "created_at") {
+        "COALESCE(created_at, CURRENT_TIMESTAMP)"
+    } else {
+        "CURRENT_TIMESTAMP"
+    };
+    let created_by_expression = if column_exists(conn, "dependencies", "created_by") {
+        "COALESCE(created_by, '')"
+    } else {
+        "''"
+    };
+    let metadata_expression = if column_exists(conn, "dependencies", "metadata") {
+        "metadata"
+    } else {
+        "'{}'"
+    };
+    let thread_id_expression = if column_exists(conn, "dependencies", "thread_id") {
+        "thread_id"
+    } else {
+        "''"
+    };
+
+    execute_batch(
+        conn,
+        &format!(
+            r"
+        CREATE TABLE dependencies_v18 (
+            issue_id TEXT NOT NULL,
+            depends_on_id TEXT NOT NULL,
+            type TEXT NOT NULL DEFAULT 'blocks',
+            created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            created_by TEXT NOT NULL DEFAULT '',
+            metadata TEXT DEFAULT '{{}}',
+            thread_id TEXT DEFAULT '',
+            PRIMARY KEY (issue_id, depends_on_id, type),
+            FOREIGN KEY (issue_id) REFERENCES issues(id) ON DELETE CASCADE
+        );
+        INSERT INTO dependencies_v18
+            (issue_id, depends_on_id, type, created_at, created_by, metadata, thread_id)
+        SELECT issue_id, depends_on_id, {type_expression}, {created_at_expression},
+               {created_by_expression}, {metadata_expression}, {thread_id_expression}
+        FROM dependencies;
+        DROP TABLE dependencies;
+        ALTER TABLE dependencies_v18 RENAME TO dependencies;
+        CREATE INDEX idx_dependencies_issue ON dependencies(issue_id);
+        CREATE INDEX idx_dependencies_depends_on ON dependencies(depends_on_id);
+        CREATE INDEX idx_dependencies_type ON dependencies(type);
+        CREATE INDEX idx_dependencies_depends_on_type ON dependencies(depends_on_id, type);
+        CREATE INDEX idx_dependencies_thread ON dependencies(thread_id) WHERE thread_id != '';
+        CREATE INDEX idx_dependencies_blocking
+            ON dependencies(depends_on_id, issue_id)
+            WHERE (type = 'blocks' OR type = 'parent-child' OR type = 'conditional-blocks' OR type = 'waits-for');
+        "
+        ),
+    )
+}
+
+fn converge_schema_v19_in_transaction(
+    conn: &Connection,
+    source_layout: SchemaConvergenceLayout,
+    target_version: u32,
+) -> Result<()> {
+    match source_layout.dependency_identity {
+        DependencyIdentityLayout::PairKeyed => {
+            tracing::info!("Converging schema v19 to typed dependency identity");
+            apply_typed_dependency_identity_migration(conn)?;
+        }
+        DependencyIdentityLayout::TypedKeyed => {}
+    }
+
+    match source_layout.template_sequences {
+        TemplateSequenceLayout::Absent => {
+            tracing::info!("Converging schema v19 to templated issue sequences");
+            execute_batch(conn, TEMPLATE_SEQUENCE_SCHEMA_SQL)?;
+        }
+        TemplateSequenceLayout::Canonical => {}
+    }
+
+    let converged = classify_schema_convergence_layout(conn)?;
+    let expected = SchemaConvergenceLayout {
+        dependency_identity: DependencyIdentityLayout::TypedKeyed,
+        template_sequences: TemplateSequenceLayout::Canonical,
+    };
+    if converged != expected {
+        return Err(schema_convergence_error(format!(
+            "postcondition mismatch; expected {expected:?}, observed {converged:?}"
+        )));
+    }
+
+    conn.execute(&format!("PRAGMA user_version = {target_version}"))
+        .map_err(BeadsError::Database)?;
+    let stamped = connection_user_version(conn)?;
+    if stamped != target_version {
+        return Err(schema_convergence_error(format!(
+            "postcondition expected user_version={target_version}, observed {stamped}"
+        )));
+    }
+
+    Ok(())
+}
+
+fn converge_schema_v19_atomic(
+    conn: &Connection,
+    source_layout: SchemaConvergenceLayout,
+) -> Result<()> {
+    let target_version = current_schema_version_u32()?;
+    conn.execute("BEGIN IMMEDIATE")?;
+    let result = converge_schema_v19_in_transaction(conn, source_layout, target_version);
+    match result {
+        Ok(()) => {
+            if let Err(error) = conn.execute("COMMIT") {
+                let _ = conn.execute("ROLLBACK");
+                return Err(BeadsError::Database(error));
+            }
+            Ok(())
+        }
+        Err(error) => {
+            let _ = conn.execute("ROLLBACK");
+            Err(error)
+        }
+    }
 }
 
 /// v16 (GitHub #384 phase 4) migration step: audited issue-specific capacity
@@ -2627,6 +3452,13 @@ fn rebuild_content_hashes_for_current_format(conn: &Connection) -> Result<usize>
     }
 }
 
+fn rebuild_content_hashes_for_current_format_in_open_transaction(
+    conn: &Connection,
+) -> Result<usize> {
+    let marked_at = Utc::now().to_rfc3339();
+    rebuild_content_hashes_for_current_format_in_transaction(conn, &marked_at)
+}
+
 fn row_text(row: &fsqlite::Row, index: usize) -> Option<String> {
     row.get(index)
         .and_then(SqliteValue::as_text)
@@ -2650,9 +3482,121 @@ fn row_bool(row: &fsqlite::Row, index: usize) -> bool {
 mod tests {
     use super::*;
     use crate::error::BeadsError;
+    use crate::storage::SqliteStorage;
+    use flate2::read::GzDecoder;
     use fsqlite::Connection;
-    use std::collections::HashSet;
+    use std::collections::{BTreeMap, HashSet};
+    use std::fs;
+    use std::io::Read;
+    use std::path::PathBuf;
     use tempfile::TempDir;
+
+    const SCHEMA_MIGRATION_OWNERS: &[(u32, &str)] = &[
+        (3, "non-null issue filter columns"),
+        (4, "ready index excludes in-progress issues"),
+        (5, "ascending active-list index"),
+        (6, "datetime and legacy-status normalization"),
+        (7, "content hash rebuild"),
+        (8, "storage-null default backfill"),
+        (9, "close metadata"),
+        (10, "source repository path"),
+        (11, "agent context"),
+        (12, "workflow gate results"),
+        (13, "event attribution"),
+        (14, "length-prefixed content hashes"),
+        (15, "transition-scoped gate history"),
+        (16, "capacity exemptions"),
+        (17, "capacity occupancy"),
+        (18, "typed dependency identity"),
+        (19, "typed dependencies plus templated issue sequences"),
+    ];
+
+    fn validate_migration_version_ownership(
+        owners: &[(u32, &str)],
+        current_version: u32,
+    ) -> std::result::Result<(), String> {
+        let mut by_version = BTreeMap::new();
+        for (version, owner) in owners {
+            if owner.trim().is_empty() {
+                return Err(format!("schema version {version} has an empty owner"));
+            }
+            if let Some(existing) = by_version.insert(*version, *owner) {
+                return Err(format!(
+                    "schema version {version} has conflicting owners: {existing:?} and {owner:?}; \
+                     incorporate current upstream main before allocating the next unused version"
+                ));
+            }
+        }
+
+        let expected_versions: Vec<u32> = (3..=current_version).collect();
+        let observed_versions: Vec<u32> = by_version.keys().copied().collect();
+        if observed_versions != expected_versions {
+            return Err(format!(
+                "schema migration ownership must cover every version from 3 through \
+                 CURRENT_SCHEMA_VERSION={current_version}; observed {observed_versions:?}"
+            ));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn migration_version_ownership_is_unique_and_current() {
+        validate_migration_version_ownership(
+            SCHEMA_MIGRATION_OWNERS,
+            current_schema_version_u32().expect("current schema version"),
+        )
+        .expect("canonical migration ownership must be unique, contiguous, and current");
+    }
+
+    #[test]
+    fn pre_reviewed_schema_version_boundary_is_exact() {
+        for version in 0..REVIEWED_MIGRATION_SOURCE_VERSIONS[0] {
+            assert!(schema_version_predates_reviewed_migrations(
+                i32::try_from(version).expect("small schema version")
+            ));
+        }
+        for version in [-1, 13, 18, CURRENT_SCHEMA_VERSION, i32::MAX] {
+            assert!(
+                !schema_version_predates_reviewed_migrations(version),
+                "schema version {version} must not enter the legacy auto-migration path"
+            );
+        }
+    }
+
+    #[test]
+    fn migration_version_ownership_conflict_has_actionable_diagnostic() {
+        let error = validate_migration_version_ownership(
+            &[(18, "typed dependency identity"), (18, "templated IDs")],
+            18,
+        )
+        .expect_err("duplicate ownership must be refused");
+        assert!(error.contains("schema version 18 has conflicting owners"));
+        assert!(error.contains("incorporate current upstream main"));
+    }
+
+    fn open_schema_migration_fixture_copy(name: &str) -> (TempDir, Connection) {
+        let fixture_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/schema_migration")
+            .join(name);
+        let mut decoder = GzDecoder::new(fs::File::open(fixture_path).expect("open fixture"));
+        let mut database = Vec::new();
+        decoder
+            .read_to_end(&mut database)
+            .expect("decompress fixture");
+        let temp = TempDir::new().expect("tempdir");
+        let db_path = temp.path().join("fixture.db");
+        fs::write(&db_path, database).expect("copy fixture database");
+        let conn =
+            Connection::open(db_path.to_string_lossy().into_owned()).expect("open fixture copy");
+        (temp, conn)
+    }
+
+    fn assert_fixture_integrity(conn: &Connection) {
+        let integrity = conn
+            .query_row("PRAGMA integrity_check")
+            .expect("integrity check");
+        assert_eq!(integrity.get(0).and_then(SqliteValue::as_text), Some("ok"));
+    }
 
     fn reviewed_v14_with_gate_history_schema(schema_sql: &str) -> (TempDir, Connection) {
         let temp = TempDir::new().expect("tempdir");
@@ -2846,7 +3790,7 @@ mod tests {
         conn.execute("DELETE FROM dirty_issues").unwrap();
         conn.execute("PRAGMA user_version = 6").unwrap();
 
-        run_migrations(&conn, false).expect("v7 migration should succeed");
+        run_migrations(&conn, false, None).expect("v7 migration should succeed");
 
         let row = conn
             .query_row("SELECT content_hash FROM issues WHERE id = 'bd-hash'")
@@ -2887,7 +3831,7 @@ mod tests {
         conn.execute("DELETE FROM dirty_issues").unwrap();
         conn.execute("PRAGMA user_version = 13").unwrap();
 
-        run_migrations(&conn, false).expect("v14 migration should succeed");
+        run_migrations(&conn, false, None).expect("v14 migration should succeed");
 
         let row = conn
             .query_row("SELECT content_hash FROM issues WHERE id = 'bd-hash-v14'")
@@ -3345,7 +4289,7 @@ mod tests {
         conn.execute("DROP TABLE gate_result_history").unwrap();
         conn.execute("PRAGMA user_version = 14").unwrap();
 
-        run_migrations(&conn, false).expect("v15 migration should succeed");
+        run_migrations(&conn, false, None).expect("v15 migration should succeed");
 
         assert!(table_exists(&conn, "gate_result_history"));
         for column in [
@@ -3394,7 +4338,7 @@ mod tests {
         conn.execute("DROP TABLE capacity_exemptions").unwrap();
         conn.execute("PRAGMA user_version = 15").unwrap();
 
-        run_migrations(&conn, false).expect("v16 migration should succeed");
+        run_migrations(&conn, false, None).expect("v16 migration should succeed");
 
         assert!(table_exists(&conn, "capacity_exemptions"));
         for column in [
@@ -3445,7 +4389,7 @@ mod tests {
         conn.execute("DROP TABLE capacity_occupancy").unwrap();
         conn.execute("PRAGMA user_version = 16").unwrap();
 
-        run_migrations(&conn, false).expect("v17 migration should succeed");
+        run_migrations(&conn, false, None).expect("v17 migration should succeed");
 
         assert!(table_exists(&conn, "capacity_occupancy"));
         for column in [
@@ -3461,6 +4405,1003 @@ mod tests {
                 "v17 migration missing capacity_occupancy.{column}"
             );
         }
+    }
+
+    #[test]
+    fn test_v18_migrates_dependency_identity_without_losing_rows() {
+        let temp = TempDir::new().expect("tempdir");
+        let db_path = temp.path().join("beads.db");
+        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+        apply_schema(&conn).expect("apply current schema");
+        conn.execute(
+            "INSERT INTO issues (id, title, status, priority, issue_type, created_at, updated_at) \
+             VALUES ('bd-a', 'A', 'open', 2, 'task', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP), \
+                    ('bd-b', 'B', 'open', 2, 'task', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+        )
+        .unwrap();
+        execute_batch(
+            &conn,
+            r"
+            ALTER TABLE dependencies RENAME TO dependencies_current;
+            CREATE TABLE dependencies (
+                issue_id TEXT NOT NULL,
+                depends_on_id TEXT NOT NULL,
+                type TEXT NOT NULL DEFAULT 'blocks',
+                created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                created_by TEXT NOT NULL DEFAULT '',
+                metadata TEXT DEFAULT '{}',
+                thread_id TEXT DEFAULT '',
+                PRIMARY KEY (issue_id, depends_on_id),
+                FOREIGN KEY (issue_id) REFERENCES issues(id) ON DELETE CASCADE
+            );
+            INSERT INTO dependencies (issue_id, depends_on_id, type)
+            VALUES ('bd-a', 'bd-b', 'blocks');
+            DROP TABLE dependencies_current;
+            PRAGMA user_version = 17;
+            ",
+        )
+        .unwrap();
+
+        run_migrations(&conn, false, None).expect("v18 migration should succeed");
+        conn.execute(
+            "INSERT INTO dependencies (issue_id, depends_on_id, type) \
+             VALUES ('bd-a', 'bd-b', 'implements')",
+        )
+        .expect("typed parallel edge");
+        let count = conn
+            .query_row(
+                "SELECT COUNT(*) FROM dependencies WHERE issue_id = 'bd-a' AND depends_on_id = 'bd-b'",
+            )
+            .unwrap()
+            .get(0)
+            .and_then(SqliteValue::as_integer);
+        assert_eq!(count, Some(2));
+    }
+
+    fn rebuild_dependencies_with_pair_identity(conn: &Connection) {
+        execute_batch(
+            conn,
+            r"
+            ALTER TABLE dependencies RENAME TO dependencies_typed_source;
+            CREATE TABLE dependencies (
+                issue_id TEXT NOT NULL,
+                depends_on_id TEXT NOT NULL,
+                type TEXT NOT NULL DEFAULT 'blocks',
+                created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                created_by TEXT NOT NULL DEFAULT '',
+                metadata TEXT DEFAULT '{}',
+                thread_id TEXT DEFAULT '',
+                PRIMARY KEY (issue_id, depends_on_id),
+                FOREIGN KEY (issue_id) REFERENCES issues(id) ON DELETE CASCADE
+            );
+            INSERT INTO dependencies
+                (issue_id, depends_on_id, type, created_at, created_by, metadata, thread_id)
+            SELECT issue_id, depends_on_id, type, created_at, created_by, metadata, thread_id
+            FROM dependencies_typed_source;
+            DROP TABLE dependencies_typed_source;
+            ",
+        )
+        .expect("install pair-keyed dependency source");
+    }
+
+    fn seed_v19_convergence_rows(conn: &Connection) {
+        conn.execute(
+            "INSERT INTO issues \
+                (id, content_hash, title, description, notes, status, priority, issue_type, \
+                 created_at, created_by, updated_at, source_repo_path, agent_context) \
+             VALUES \
+                ('bd-source', 'source-hash', 'Source', 'source-description', 'source-notes', \
+                 'open', 2, 'task', '2026-08-01T01:02:03Z', 'fixture-author', \
+                 '2026-08-02T02:03:04Z', '/fixture/source', '{\"rule\":\"preserve\"}'), \
+                ('bd-target', 'target-hash', 'Target', 'target-description', 'target-notes', \
+                 'open', 1, 'feature', '2026-08-03T03:04:05Z', 'fixture-author', \
+                 '2026-08-04T04:05:06Z', '/fixture/target', '{\"rule\":\"retain\"}')",
+        )
+        .expect("seed issues");
+        conn.execute(
+            "INSERT INTO dependencies \
+             (issue_id, depends_on_id, type, created_at, created_by, metadata, thread_id) \
+             VALUES ('bd-source', 'bd-target', 'blocks', '2026-08-05T05:06:07Z', \
+                     'migration-test', '{\"proof\":true}', 'thread-19')",
+        )
+        .expect("seed dependency");
+        conn.execute("INSERT INTO id_counters (name, next_value) VALUES ('issue', 43)")
+            .expect("seed counter");
+        conn.execute(
+            "INSERT INTO issue_sequences (issue_id, sequence_number) VALUES ('bd-source', 42)",
+        )
+        .expect("seed sequence");
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    struct CompleteLineageFixture {
+        version: u32,
+        dependency_identity: DependencyIdentityLayout,
+        template_sequences: TemplateSequenceLayout,
+    }
+
+    fn prepare_complete_lineage_fixture_copy(
+        fixture: CompleteLineageFixture,
+    ) -> (TempDir, PathBuf, PathBuf) {
+        let temp = TempDir::new().expect("tempdir");
+        let source_path = temp.path().join("source.db");
+        let trial_path = temp.path().join("trial.db");
+
+        drop(SqliteStorage::open(&source_path).expect("create complete current-schema source"));
+        let conn = Connection::open(source_path.to_string_lossy().into_owned())
+            .expect("open complete lineage source");
+        seed_v19_convergence_rows(&conn);
+        if fixture.dependency_identity == DependencyIdentityLayout::PairKeyed {
+            rebuild_dependencies_with_pair_identity(&conn);
+        } else {
+            conn.execute(
+                "INSERT INTO dependencies \
+                    (issue_id, depends_on_id, type, created_at, created_by, metadata, thread_id) \
+                 VALUES ('bd-source', 'bd-target', 'implements', \
+                         '2026-08-06T06:07:08Z', 'fixture-author', \
+                         '{\"proof\":\"parallel\"}', 'thread-implements')",
+            )
+            .expect("seed type-distinct dependency");
+        }
+        if fixture.template_sequences == TemplateSequenceLayout::Absent {
+            conn.execute("DROP TABLE issue_sequences")
+                .expect("remove issue sequences from upstream-shaped source");
+            conn.execute("DROP TABLE id_counters")
+                .expect("remove ID counters from upstream-shaped source");
+        }
+        conn.execute(&format!("PRAGMA user_version = {}", fixture.version))
+            .expect("stamp source lineage");
+        assert_seeded_issue_rows_preserved(&conn);
+        assert!(table_exists(&conn, "capacity_exemptions"));
+        assert!(table_exists(&conn, "capacity_exemption_history"));
+        assert!(table_exists(&conn, "capacity_occupancy"));
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            .expect("checkpoint complete source before copying");
+        drop(conn);
+
+        fs::copy(&source_path, &trial_path).expect("copy complete source for migration trial");
+        (temp, source_path, trial_path)
+    }
+
+    fn assert_seeded_issue_rows_preserved(conn: &Connection) {
+        for (id, expected) in [
+            (
+                "bd-source",
+                [
+                    "source-hash",
+                    "Source",
+                    "source-description",
+                    "source-notes",
+                    "open",
+                    "2",
+                    "task",
+                    "2026-08-01T01:02:03Z",
+                    "fixture-author",
+                    "2026-08-02T02:03:04Z",
+                    "/fixture/source",
+                    "{\"rule\":\"preserve\"}",
+                ],
+            ),
+            (
+                "bd-target",
+                [
+                    "target-hash",
+                    "Target",
+                    "target-description",
+                    "target-notes",
+                    "open",
+                    "1",
+                    "feature",
+                    "2026-08-03T03:04:05Z",
+                    "fixture-author",
+                    "2026-08-04T04:05:06Z",
+                    "/fixture/target",
+                    "{\"rule\":\"retain\"}",
+                ],
+            ),
+        ] {
+            let row = conn
+                .query_row(&format!(
+                    "SELECT content_hash, title, description, notes, status, \
+                            CAST(priority AS TEXT), issue_type, created_at, created_by, \
+                            updated_at, source_repo_path, agent_context \
+                     FROM issues WHERE id = '{id}'"
+                ))
+                .expect("read preserved issue row");
+            for (index, expected_value) in expected.iter().enumerate() {
+                assert_eq!(
+                    row.get(index).and_then(SqliteValue::as_text),
+                    Some(*expected_value),
+                    "{id} column {index} changed during migration"
+                );
+            }
+        }
+    }
+
+    fn assert_complete_lineage_converged(
+        conn: &Connection,
+        expected_relation_types: &[&str],
+        expected_sequence: bool,
+    ) {
+        assert_eq!(connection_user_version(conn).unwrap(), 19);
+        assert!(runtime_schema_compatible(conn));
+        assert_seeded_issue_rows_preserved(conn);
+
+        let relation_rows = conn
+            .query(
+                "SELECT type FROM dependencies \
+                 WHERE issue_id = 'bd-source' AND depends_on_id = 'bd-target' ORDER BY type",
+            )
+            .expect("read preserved dependency types");
+        let relation_types: Vec<&str> = relation_rows
+            .iter()
+            .filter_map(|row| row.get(0).and_then(SqliteValue::as_text))
+            .collect();
+        assert_eq!(relation_types, expected_relation_types);
+        let dependency = conn
+            .query_row(
+                "SELECT created_at, created_by, metadata, thread_id FROM dependencies \
+                 WHERE issue_id = 'bd-source' AND depends_on_id = 'bd-target' AND type = 'blocks'",
+            )
+            .expect("read preserved dependency payload");
+        assert_eq!(
+            dependency.get(0).and_then(SqliteValue::as_text),
+            Some("2026-08-05T05:06:07Z")
+        );
+        assert_eq!(
+            dependency.get(1).and_then(SqliteValue::as_text),
+            Some("migration-test")
+        );
+        assert_eq!(
+            dependency.get(2).and_then(SqliteValue::as_text),
+            Some("{\"proof\":true}")
+        );
+        assert_eq!(
+            dependency.get(3).and_then(SqliteValue::as_text),
+            Some("thread-19")
+        );
+
+        let sequence = conn
+            .query_row("SELECT COUNT(*), MAX(sequence_number) FROM issue_sequences")
+            .expect("read canonical issue sequences");
+        let counter = conn
+            .query_row("SELECT COUNT(*), MAX(next_value) FROM id_counters")
+            .expect("read canonical ID counters");
+        if expected_sequence {
+            assert_eq!(sequence.get(0).and_then(SqliteValue::as_integer), Some(1));
+            assert_eq!(sequence.get(1).and_then(SqliteValue::as_integer), Some(42));
+            assert_eq!(counter.get(0).and_then(SqliteValue::as_integer), Some(1));
+            assert_eq!(counter.get(1).and_then(SqliteValue::as_integer), Some(43));
+        } else {
+            assert_eq!(sequence.get(0).and_then(SqliteValue::as_integer), Some(0));
+            assert_eq!(counter.get(0).and_then(SqliteValue::as_integer), Some(0));
+        }
+        assert_fixture_integrity(conn);
+    }
+
+    #[test]
+    fn test_v17_v18_physical_lineage_fixtures_converge_from_copies() {
+        for (fixture, relation_types, has_sequence) in [
+            (
+                CompleteLineageFixture {
+                    version: 17,
+                    dependency_identity: DependencyIdentityLayout::PairKeyed,
+                    template_sequences: TemplateSequenceLayout::Canonical,
+                },
+                &["blocks"][..],
+                true,
+            ),
+            (
+                CompleteLineageFixture {
+                    version: 18,
+                    dependency_identity: DependencyIdentityLayout::PairKeyed,
+                    template_sequences: TemplateSequenceLayout::Canonical,
+                },
+                &["blocks"][..],
+                true,
+            ),
+            (
+                CompleteLineageFixture {
+                    version: 18,
+                    dependency_identity: DependencyIdentityLayout::TypedKeyed,
+                    template_sequences: TemplateSequenceLayout::Absent,
+                },
+                &["blocks", "implements"][..],
+                false,
+            ),
+            (
+                CompleteLineageFixture {
+                    version: 18,
+                    dependency_identity: DependencyIdentityLayout::TypedKeyed,
+                    template_sequences: TemplateSequenceLayout::Canonical,
+                },
+                &["blocks", "implements"][..],
+                true,
+            ),
+        ] {
+            let (_temp, source_path, trial_path) = prepare_complete_lineage_fixture_copy(fixture);
+
+            drop(SqliteStorage::open(&trial_path).expect("migrate complete fixture copy on open"));
+
+            let migrated = Connection::open(trial_path.to_string_lossy().into_owned())
+                .expect("open migrated fixture copy");
+            assert_complete_lineage_converged(&migrated, relation_types, has_sequence);
+
+            let source = Connection::open(source_path.to_string_lossy().into_owned())
+                .expect("reopen untouched source fixture");
+            assert_eq!(connection_user_version(&source).unwrap(), fixture.version);
+            assert_seeded_issue_rows_preserved(&source);
+            assert_fixture_integrity(&source);
+        }
+    }
+
+    #[test]
+    fn test_v19_canonical_physical_fixture_is_a_copy_based_no_op() {
+        let (_temp, source_path, trial_path) =
+            prepare_complete_lineage_fixture_copy(CompleteLineageFixture {
+                version: 19,
+                dependency_identity: DependencyIdentityLayout::TypedKeyed,
+                template_sequences: TemplateSequenceLayout::Canonical,
+            });
+        let conn = Connection::open(trial_path.to_string_lossy().into_owned())
+            .expect("open complete canonical fixture copy");
+        assert!(runtime_schema_compatible(&conn));
+        conn.execute("CREATE TABLE dependencies_v18 (sentinel TEXT)")
+            .expect("reserve dependency rebuild table name");
+        conn.execute("INSERT INTO dependencies_v18 (sentinel) VALUES ('canonical-no-op')")
+            .expect("seed no-op sentinel");
+        drop(conn);
+
+        drop(
+            SqliteStorage::open(&trial_path).expect("open canonical fixture through runtime path"),
+        );
+
+        let conn = Connection::open(trial_path.to_string_lossy().into_owned())
+            .expect("reopen canonical fixture after runtime open");
+        assert_complete_lineage_converged(&conn, &["blocks", "implements"], true);
+
+        let sentinel = conn
+            .query_row("SELECT sentinel FROM dependencies_v18")
+            .unwrap();
+        assert_eq!(
+            sentinel.get(0).and_then(SqliteValue::as_text),
+            Some("canonical-no-op")
+        );
+
+        let source = Connection::open(source_path.to_string_lossy().into_owned())
+            .expect("reopen untouched canonical source");
+        assert_complete_lineage_converged(&source, &["blocks", "implements"], true);
+    }
+
+    #[test]
+    fn test_v18_partial_template_fixture_refuses_without_mutating_copy() {
+        let (_temp, conn) = open_schema_migration_fixture_copy("schema18_partial_templates.db.gz");
+
+        let error = run_migrations_atomic(&conn, 18, 19)
+            .expect_err("partial template fixture must be refused");
+
+        assert!(
+            error
+                .to_string()
+                .contains("template sequence layout is partial")
+        );
+        assert_eq!(connection_user_version(&conn).unwrap(), 18);
+        assert!(table_exists(&conn, "id_counters"));
+        assert!(!table_exists(&conn, "issue_sequences"));
+        let dependency_count = conn.query_row("SELECT COUNT(*) FROM dependencies").unwrap();
+        assert_eq!(
+            dependency_count.get(0).and_then(SqliteValue::as_integer),
+            Some(2)
+        );
+        assert_fixture_integrity(&conn);
+    }
+
+    #[test]
+    fn test_v18_pair_fixture_rolls_back_injected_rebuild_collision() {
+        let (_temp, conn) = open_schema_migration_fixture_copy("schema18_rebuild_collision.db.gz");
+
+        let error = run_migrations_atomic(&conn, 18, 19)
+            .expect_err("rebuild collision fixture must roll back");
+
+        assert!(error.to_string().contains("dependencies_v18"));
+        assert_eq!(connection_user_version(&conn).unwrap(), 18);
+        assert_eq!(
+            classify_dependency_identity(&conn).unwrap(),
+            DependencyIdentityLayout::PairKeyed
+        );
+        let dependency = conn
+            .query_row(
+                "SELECT type, created_at, metadata, thread_id FROM dependencies \
+                 WHERE issue_id = 'bd-source' AND depends_on_id = 'bd-target'",
+            )
+            .unwrap();
+        assert_eq!(
+            dependency.get(0).and_then(SqliteValue::as_text),
+            Some("blocks")
+        );
+        assert_eq!(
+            dependency.get(1).and_then(SqliteValue::as_text),
+            Some("2026-08-05T05:06:07.123456789Z")
+        );
+        assert!(matches!(dependency.get(2), Some(SqliteValue::Null)));
+        assert!(matches!(dependency.get(3), Some(SqliteValue::Null)));
+        let sequence = conn
+            .query_row("SELECT sequence_number FROM issue_sequences WHERE issue_id = 'bd-source'")
+            .unwrap();
+        assert_eq!(sequence.get(0).and_then(SqliteValue::as_integer), Some(42));
+        let counter = conn
+            .query_row("SELECT next_value FROM id_counters WHERE name = 'issue'")
+            .unwrap();
+        assert_eq!(counter.get(0).and_then(SqliteValue::as_integer), Some(43));
+        let sentinel = conn
+            .query_row("SELECT sentinel FROM dependencies_v18")
+            .unwrap();
+        assert_eq!(
+            sentinel.get(0).and_then(SqliteValue::as_text),
+            Some("rollback-witness")
+        );
+        assert_fixture_integrity(&conn);
+    }
+
+    #[test]
+    fn test_apply_schema_rolls_back_repairs_on_late_v19_collision() {
+        let (_temp, conn) = open_schema_migration_fixture_copy("schema18_rebuild_collision.db.gz");
+        execute_batch(
+            &conn,
+            r"
+            DROP TABLE IF EXISTS blocked_issues_cache;
+            CREATE TABLE blocked_issues_cache (legacy_marker TEXT);
+            INSERT INTO blocked_issues_cache (legacy_marker) VALUES ('preserved');
+            DROP INDEX IF EXISTS idx_issues_status;
+            ",
+        )
+        .expect("install pre-schema repair witnesses");
+        assert!(!index_exists(&conn, "idx_issues_status"));
+
+        let error = apply_schema(&conn).expect_err("late convergence collision must roll back");
+
+        assert!(error.to_string().contains("dependencies_v18"));
+        assert_eq!(connection_user_version(&conn).unwrap(), 18);
+        let marker = conn
+            .query_row("SELECT legacy_marker FROM blocked_issues_cache")
+            .unwrap();
+        assert_eq!(
+            marker.get(0).and_then(SqliteValue::as_text),
+            Some("preserved")
+        );
+        assert!(!index_exists(&conn, "idx_issues_status"));
+        assert_eq!(
+            classify_dependency_identity(&conn).unwrap(),
+            DependencyIdentityLayout::PairKeyed
+        );
+        let sentinel = conn
+            .query_row("SELECT sentinel FROM dependencies_v18")
+            .unwrap();
+        assert_eq!(
+            sentinel.get(0).and_then(SqliteValue::as_text),
+            Some("rollback-witness")
+        );
+        assert_fixture_integrity(&conn);
+    }
+
+    #[test]
+    fn test_v19_converges_fork_v18_templates_and_pair_dependency_identity() {
+        let temp = TempDir::new().expect("tempdir");
+        let db_path = temp.path().join("fork-v18.db");
+        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+        apply_schema(&conn).expect("apply current schema");
+        seed_v19_convergence_rows(&conn);
+        rebuild_dependencies_with_pair_identity(&conn);
+        conn.execute("PRAGMA user_version = 18")
+            .expect("stamp fork v18 source");
+
+        apply_schema(&conn).expect("converge fork v18 source");
+
+        assert_eq!(connection_user_version(&conn).unwrap(), 19);
+        conn.execute(
+            "INSERT INTO dependencies (issue_id, depends_on_id, type) \
+             VALUES ('bd-source', 'bd-target', 'implements')",
+        )
+        .expect("typed parallel edge after convergence");
+        let dependency = conn
+            .query_row(
+                "SELECT COUNT(*), MIN(created_at), MIN(created_by), MIN(metadata), MIN(thread_id) \
+                 FROM dependencies WHERE issue_id = 'bd-source' AND depends_on_id = 'bd-target'",
+            )
+            .unwrap();
+        assert_eq!(dependency.get(0).and_then(SqliteValue::as_integer), Some(2));
+        let sequence = conn
+            .query_row("SELECT sequence_number FROM issue_sequences WHERE issue_id = 'bd-source'")
+            .unwrap();
+        assert_eq!(sequence.get(0).and_then(SqliteValue::as_integer), Some(42));
+        let counter = conn
+            .query_row("SELECT next_value FROM id_counters WHERE name = 'issue'")
+            .unwrap();
+        assert_eq!(counter.get(0).and_then(SqliteValue::as_integer), Some(43));
+    }
+
+    #[test]
+    fn test_v19_pair_to_typed_convergence_preserves_nullable_dependency_fields() {
+        let temp = TempDir::new().expect("tempdir");
+        let db_path = temp.path().join("nullable-dependency-fields.db");
+        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+        apply_schema(&conn).expect("apply current schema");
+        seed_v19_convergence_rows(&conn);
+        rebuild_dependencies_with_pair_identity(&conn);
+        conn.execute(
+            "UPDATE dependencies \
+             SET created_at = '2026-08-05T05:06:07.123456789Z', metadata = NULL, thread_id = NULL \
+             WHERE issue_id = 'bd-source' AND depends_on_id = 'bd-target'",
+        )
+        .expect("seed nullable dependency fields");
+        conn.execute("PRAGMA user_version = 18")
+            .expect("stamp pair-keyed v18 source");
+
+        apply_schema(&conn).expect("converge pair-keyed v18 source");
+
+        let dependency = conn
+            .query_row(
+                "SELECT created_at, metadata, thread_id FROM dependencies \
+                 WHERE issue_id = 'bd-source' AND depends_on_id = 'bd-target'",
+            )
+            .unwrap();
+        assert_eq!(
+            dependency.get(0).and_then(SqliteValue::as_text),
+            Some("2026-08-05T05:06:07.123456789Z")
+        );
+        assert!(matches!(dependency.get(1), Some(SqliteValue::Null)));
+        assert!(matches!(dependency.get(2), Some(SqliteValue::Null)));
+    }
+
+    #[test]
+    fn test_v19_converges_v17_with_templates_and_pair_dependency_identity() {
+        let temp = TempDir::new().expect("tempdir");
+        let db_path = temp.path().join("templated-v17.db");
+        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+        apply_schema(&conn).expect("apply current schema");
+        seed_v19_convergence_rows(&conn);
+        rebuild_dependencies_with_pair_identity(&conn);
+        conn.execute("PRAGMA user_version = 17")
+            .expect("stamp templated v17 source");
+
+        apply_schema(&conn).expect("converge templated v17 source");
+
+        assert_eq!(connection_user_version(&conn).unwrap(), 19);
+        conn.execute(
+            "INSERT INTO dependencies (issue_id, depends_on_id, type) \
+             VALUES ('bd-source', 'bd-target', 'implements')",
+        )
+        .expect("typed parallel edge after convergence");
+        let dependency = conn
+            .query_row(
+                "SELECT COUNT(*), MIN(created_at), MIN(created_by), MIN(metadata), MIN(thread_id) \
+                 FROM dependencies WHERE issue_id = 'bd-source' AND depends_on_id = 'bd-target'",
+            )
+            .unwrap();
+        assert_eq!(dependency.get(0).and_then(SqliteValue::as_integer), Some(2));
+        let sequence = conn
+            .query_row("SELECT sequence_number FROM issue_sequences WHERE issue_id = 'bd-source'")
+            .unwrap();
+        assert_eq!(sequence.get(0).and_then(SqliteValue::as_integer), Some(42));
+    }
+
+    #[test]
+    fn test_v19_converges_v18_with_both_canonical_structures() {
+        let temp = TempDir::new().expect("tempdir");
+        let db_path = temp.path().join("both-v18.db");
+        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+        apply_schema(&conn).expect("apply current schema");
+        seed_v19_convergence_rows(&conn);
+        conn.execute("PRAGMA user_version = 18")
+            .expect("stamp both-structures v18 source");
+
+        apply_schema(&conn).expect("converge both-structures v18 source");
+
+        assert_eq!(connection_user_version(&conn).unwrap(), 19);
+        let dependency = conn
+            .query_row(
+                "SELECT type, created_at, created_by, metadata, thread_id FROM dependencies \
+                 WHERE issue_id = 'bd-source' AND depends_on_id = 'bd-target'",
+            )
+            .unwrap();
+        assert_eq!(
+            dependency.get(0).and_then(SqliteValue::as_text),
+            Some("blocks")
+        );
+        assert_eq!(
+            dependency.get(1).and_then(SqliteValue::as_text),
+            Some("2026-08-05T05:06:07Z")
+        );
+        assert_eq!(
+            dependency.get(2).and_then(SqliteValue::as_text),
+            Some("migration-test")
+        );
+        assert_eq!(
+            dependency.get(3).and_then(SqliteValue::as_text),
+            Some("{\"proof\":true}")
+        );
+        assert_eq!(
+            dependency.get(4).and_then(SqliteValue::as_text),
+            Some("thread-19")
+        );
+    }
+
+    #[test]
+    fn test_v19_canonical_layout_is_attested_without_dependency_rebuild() {
+        let temp = TempDir::new().expect("tempdir");
+        let db_path = temp.path().join("canonical-v19.db");
+        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+        apply_schema(&conn).expect("apply current schema");
+        seed_v19_convergence_rows(&conn);
+        conn.execute("CREATE TABLE dependencies_v18 (sentinel TEXT)")
+            .expect("reserve rebuild table name");
+        conn.execute("INSERT INTO dependencies_v18 (sentinel) VALUES ('unchanged')")
+            .expect("seed rebuild sentinel");
+        drop(conn);
+
+        drop(SqliteStorage::open(&db_path).expect("open canonical v19 through runtime path"));
+        let conn = Connection::open(db_path.to_string_lossy().into_owned())
+            .expect("reopen attested canonical v19 source");
+
+        assert_eq!(connection_user_version(&conn).unwrap(), 19);
+        assert!(runtime_schema_compatible(&conn));
+        assert_seeded_issue_rows_preserved(&conn);
+        let sentinel = conn
+            .query_row("SELECT sentinel FROM dependencies_v18")
+            .unwrap();
+        assert_eq!(
+            sentinel.get(0).and_then(SqliteValue::as_text),
+            Some("unchanged")
+        );
+        let dependency = conn
+            .query_row(
+                "SELECT created_at, created_by, metadata, thread_id FROM dependencies \
+                 WHERE issue_id = 'bd-source' AND depends_on_id = 'bd-target'",
+            )
+            .unwrap();
+        assert_eq!(
+            dependency.get(0).and_then(SqliteValue::as_text),
+            Some("2026-08-05T05:06:07Z")
+        );
+        assert_eq!(
+            dependency.get(1).and_then(SqliteValue::as_text),
+            Some("migration-test")
+        );
+        assert_eq!(
+            dependency.get(2).and_then(SqliteValue::as_text),
+            Some("{\"proof\":true}")
+        );
+        assert_eq!(
+            dependency.get(3).and_then(SqliteValue::as_text),
+            Some("thread-19")
+        );
+    }
+
+    #[test]
+    fn test_v19_pair_rebuild_repairs_missing_dependency_indexes_before_stamp() {
+        let temp = TempDir::new().expect("tempdir");
+        let db_path = temp.path().join("pair-missing-dependency-indexes.db");
+        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+        apply_schema(&conn).expect("apply current schema");
+        rebuild_dependencies_with_pair_identity(&conn);
+        assert!(
+            DEPENDENCY_INDEXES
+                .iter()
+                .all(|expected| !index_exists(&conn, expected.name))
+        );
+        conn.execute("PRAGMA user_version = 18")
+            .expect("stamp pair-keyed v18 source");
+
+        run_migrations_atomic(&conn, 18, 19)
+            .expect("pair-keyed rebuild must restore canonical dependency indexes");
+
+        assert_eq!(connection_user_version(&conn).unwrap(), 19);
+        attest_dependency_indexes(&conn).expect("attest rebuilt dependency indexes");
+    }
+
+    #[test]
+    fn test_v19_refuses_malformed_dependency_index_without_advancing_stamp() {
+        let temp = TempDir::new().expect("tempdir");
+        let db_path = temp.path().join("malformed-dependency-index.db");
+        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+        apply_schema(&conn).expect("apply current schema");
+        execute_batch(
+            &conn,
+            r"
+            DROP INDEX idx_dependencies_thread;
+            CREATE INDEX idx_dependencies_thread
+                ON dependencies(thread_id) WHERE thread_id IS NOT NULL;
+            PRAGMA user_version = 18;
+            ",
+        )
+        .expect("install same-named malformed dependency index");
+
+        let error = run_migrations_atomic(&conn, 18, 19)
+            .expect_err("malformed dependency index must be refused");
+
+        assert!(
+            error.to_string().contains("idx_dependencies_thread"),
+            "refusal should identify the malformed dependency index: {error}"
+        );
+        assert_eq!(connection_user_version(&conn).unwrap(), 18);
+        let index_sql = conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type='index' \
+                 AND name='idx_dependencies_thread'",
+            )
+            .unwrap();
+        assert!(
+            index_sql
+                .get(0)
+                .and_then(SqliteValue::as_text)
+                .is_some_and(|sql| sql.contains("thread_id IS NOT NULL"))
+        );
+    }
+
+    #[test]
+    fn test_v19_converges_upstream_v18_typed_identity_without_templates() {
+        let temp = TempDir::new().expect("tempdir");
+        let db_path = temp.path().join("upstream-v18.db");
+        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+        apply_schema(&conn).expect("apply current schema");
+        conn.execute("DROP TABLE issue_sequences").unwrap();
+        conn.execute("DROP TABLE id_counters").unwrap();
+        conn.execute("PRAGMA user_version = 18")
+            .expect("stamp upstream v18 source");
+
+        apply_schema(&conn).expect("converge upstream v18 source");
+
+        assert_eq!(connection_user_version(&conn).unwrap(), 19);
+        assert!(table_exists(&conn, "id_counters"));
+        assert!(table_exists(&conn, "issue_sequences"));
+    }
+
+    fn assert_dependency_schema_refused_before_pre_schema_side_effects(
+        dependency_schema: &str,
+        expected_error: &str,
+    ) {
+        let temp = TempDir::new().expect("tempdir");
+        let db_path = temp.path().join("malformed-dependency-schema.db");
+        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+        apply_schema(&conn).expect("apply current schema");
+        execute_batch(
+            &conn,
+            &format!(
+                r"
+                ALTER TABLE dependencies RENAME TO dependencies_canonical;
+                {dependency_schema}
+                DROP TABLE dependencies_canonical;
+                DROP TABLE blocked_issues_cache;
+                CREATE TABLE blocked_issues_cache (legacy_marker TEXT);
+                INSERT INTO blocked_issues_cache (legacy_marker) VALUES ('preserved');
+                PRAGMA user_version = 18;
+                "
+            ),
+        )
+        .expect("install malformed dependency schema");
+
+        let error = apply_schema(&conn).expect_err("malformed dependency schema must be refused");
+
+        assert!(
+            error.to_string().contains(expected_error),
+            "refusal should identify the malformed dependency schema: {error}"
+        );
+        assert_eq!(connection_user_version(&conn).unwrap(), 18);
+        let marker = conn
+            .query_row("SELECT legacy_marker FROM blocked_issues_cache")
+            .unwrap();
+        assert_eq!(
+            marker.get(0).and_then(SqliteValue::as_text),
+            Some("preserved")
+        );
+    }
+
+    #[test]
+    fn test_v19_refuses_dependency_schema_with_missing_payload_column() {
+        assert_dependency_schema_refused_before_pre_schema_side_effects(
+            r"
+            CREATE TABLE dependencies (
+                issue_id TEXT NOT NULL,
+                depends_on_id TEXT NOT NULL,
+                type TEXT NOT NULL DEFAULT 'blocks',
+                created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                created_by TEXT NOT NULL DEFAULT '',
+                thread_id TEXT DEFAULT '',
+                PRIMARY KEY (issue_id, depends_on_id),
+                FOREIGN KEY (issue_id) REFERENCES issues(id) ON DELETE CASCADE
+            );
+            ",
+            "dependencies has 6 columns, expected 7",
+        );
+    }
+
+    #[test]
+    fn test_v19_refuses_dependency_schema_with_malformed_payload_column() {
+        assert_dependency_schema_refused_before_pre_schema_side_effects(
+            r"
+            CREATE TABLE dependencies (
+                issue_id TEXT NOT NULL,
+                depends_on_id TEXT NOT NULL,
+                type TEXT NOT NULL DEFAULT 'blocks',
+                created_at TEXT DEFAULT '',
+                created_by TEXT NOT NULL DEFAULT '',
+                metadata TEXT DEFAULT '{}',
+                thread_id TEXT DEFAULT '',
+                PRIMARY KEY (issue_id, depends_on_id, type),
+                FOREIGN KEY (issue_id) REFERENCES issues(id) ON DELETE CASCADE
+            );
+            ",
+            "dependencies column 3 is not canonical",
+        );
+    }
+
+    #[test]
+    fn test_v19_refuses_dependency_schema_with_missing_foreign_key() {
+        assert_dependency_schema_refused_before_pre_schema_side_effects(
+            r"
+            CREATE TABLE dependencies (
+                issue_id TEXT NOT NULL,
+                depends_on_id TEXT NOT NULL,
+                type TEXT NOT NULL DEFAULT 'blocks',
+                created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                created_by TEXT NOT NULL DEFAULT '',
+                metadata TEXT DEFAULT '{}',
+                thread_id TEXT DEFAULT '',
+                PRIMARY KEY (issue_id, depends_on_id)
+            );
+            ",
+            "dependencies has 0 foreign keys, expected 1",
+        );
+    }
+
+    #[test]
+    fn test_v19_refuses_dependency_schema_with_malformed_foreign_key() {
+        assert_dependency_schema_refused_before_pre_schema_side_effects(
+            r"
+            CREATE TABLE dependencies (
+                issue_id TEXT NOT NULL,
+                depends_on_id TEXT NOT NULL,
+                type TEXT NOT NULL DEFAULT 'blocks',
+                created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                created_by TEXT NOT NULL DEFAULT '',
+                metadata TEXT DEFAULT '{}',
+                thread_id TEXT DEFAULT '',
+                PRIMARY KEY (issue_id, depends_on_id, type),
+                FOREIGN KEY (depends_on_id) REFERENCES issues(id) ON DELETE CASCADE
+            );
+            ",
+            "dependencies has a non-canonical foreign key",
+        );
+    }
+
+    #[test]
+    fn test_v19_refuses_missing_dependencies_before_pre_schema_side_effects() {
+        let temp = TempDir::new().expect("tempdir");
+        let db_path = temp.path().join("missing-dependencies.db");
+        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+        apply_schema(&conn).expect("apply current schema");
+        execute_batch(
+            &conn,
+            r"
+            DROP TABLE dependencies;
+            DROP TABLE blocked_issues_cache;
+            CREATE TABLE blocked_issues_cache (legacy_marker TEXT);
+            INSERT INTO blocked_issues_cache (legacy_marker) VALUES ('preserved');
+            PRAGMA user_version = 18;
+            ",
+        )
+        .expect("install incomplete v18 source");
+
+        let error = apply_schema(&conn).expect_err("missing dependencies must be refused");
+
+        assert!(error.to_string().contains("dependencies table is absent"));
+        assert_eq!(connection_user_version(&conn).unwrap(), 18);
+        assert!(!table_exists(&conn, "dependencies"));
+        let marker = conn
+            .query_row("SELECT legacy_marker FROM blocked_issues_cache")
+            .unwrap();
+        assert_eq!(
+            marker.get(0).and_then(SqliteValue::as_text),
+            Some("preserved")
+        );
+    }
+
+    #[test]
+    fn test_v19_refuses_partial_template_layout_without_advancing_stamp() {
+        let temp = TempDir::new().expect("tempdir");
+        let db_path = temp.path().join("partial-templates.db");
+        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+        apply_schema(&conn).expect("apply current schema");
+        conn.execute("DROP TABLE issue_sequences").unwrap();
+        conn.execute("PRAGMA user_version = 18")
+            .expect("stamp divergent v18 source");
+
+        let error = apply_schema(&conn).expect_err("partial template layout must be refused");
+
+        assert!(
+            error.to_string().contains("template"),
+            "refusal should identify the malformed template layout: {error}"
+        );
+        assert_eq!(connection_user_version(&conn).unwrap(), 18);
+        assert!(!table_exists(&conn, "issue_sequences"));
+    }
+
+    #[test]
+    fn test_v19_refuses_malformed_dependency_identity_without_advancing_stamp() {
+        let temp = TempDir::new().expect("tempdir");
+        let db_path = temp.path().join("malformed-dependencies.db");
+        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+        apply_schema(&conn).expect("apply current schema");
+        execute_batch(
+            &conn,
+            r"
+            ALTER TABLE dependencies RENAME TO dependencies_canonical;
+            CREATE TABLE dependencies (
+                issue_id TEXT NOT NULL,
+                depends_on_id TEXT NOT NULL,
+                type TEXT NOT NULL DEFAULT 'blocks',
+                created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                created_by TEXT NOT NULL DEFAULT '',
+                metadata TEXT DEFAULT '{}',
+                thread_id TEXT DEFAULT '',
+                PRIMARY KEY (issue_id, type, depends_on_id)
+            );
+            DROP TABLE dependencies_canonical;
+            DROP TABLE blocked_issues_cache;
+            CREATE TABLE blocked_issues_cache (legacy_marker TEXT);
+            INSERT INTO blocked_issues_cache (legacy_marker) VALUES ('preserved');
+            PRAGMA user_version = 18;
+            ",
+        )
+        .expect("install malformed dependency identity");
+
+        let error = apply_schema(&conn).expect_err("malformed dependency identity must be refused");
+
+        assert!(
+            error
+                .to_string()
+                .contains("dependencies primary key is malformed"),
+            "refusal should identify malformed dependency identity: {error}"
+        );
+        assert_eq!(connection_user_version(&conn).unwrap(), 18);
+        let marker = conn
+            .query_row("SELECT legacy_marker FROM blocked_issues_cache")
+            .unwrap();
+        assert_eq!(
+            marker.get(0).and_then(SqliteValue::as_text),
+            Some("preserved")
+        );
+    }
+
+    #[test]
+    fn test_v19_dependency_rebuild_failure_rolls_back_without_advancing_stamp() {
+        let temp = TempDir::new().expect("tempdir");
+        let db_path = temp.path().join("rollback-v18.db");
+        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+        apply_schema(&conn).expect("apply current schema");
+        seed_v19_convergence_rows(&conn);
+        rebuild_dependencies_with_pair_identity(&conn);
+        conn.execute("CREATE TABLE dependencies_v18 (sentinel TEXT)")
+            .expect("inject typed migration collision");
+        conn.execute("PRAGMA user_version = 18")
+            .expect("stamp fork v18 source");
+
+        let error = run_migrations_atomic(&conn, 18, 19)
+            .expect_err("injected rebuild failure must abort convergence");
+
+        assert!(error.to_string().contains("dependencies_v18"));
+        assert_eq!(connection_user_version(&conn).unwrap(), 18);
+        let dependency = conn
+            .query_row("SELECT type FROM dependencies WHERE issue_id = 'bd-source'")
+            .unwrap();
+        assert_eq!(
+            dependency.get(0).and_then(SqliteValue::as_text),
+            Some("blocks")
+        );
+        let sequence = conn
+            .query_row("SELECT sequence_number FROM issue_sequences WHERE issue_id = 'bd-source'")
+            .unwrap();
+        assert_eq!(sequence.get(0).and_then(SqliteValue::as_integer), Some(42));
     }
 
     /// Regression for beads_rust#290: legacy DBs that pre-date the
@@ -3494,7 +5435,7 @@ mod tests {
         ).unwrap();
         conn.execute("PRAGMA user_version = 6").unwrap();
 
-        run_migrations(&conn, false)
+        run_migrations(&conn, false, None)
             .expect("v7 migration must succeed against legacy dirty_issues schema");
 
         let dirty_row = conn
@@ -3578,6 +5519,8 @@ mod tests {
     }
 
     #[test]
+    // This fixture must prove every later migration artifact remains untouched.
+    #[allow(clippy::too_many_lines)]
     fn test_reviewed_migration_refuses_9_to_10_without_applying_later_steps() {
         // The explicit reviewed migration hook is deliberately not the
         // automatic open-time migration ladder. A request for the old 9->10
@@ -4101,7 +6044,7 @@ mod tests {
         .unwrap();
 
         // Run migrations
-        run_migrations(&conn, false).unwrap();
+        run_migrations(&conn, false, None).unwrap();
 
         // Verify columns were updated
         let cols: Vec<String> = conn

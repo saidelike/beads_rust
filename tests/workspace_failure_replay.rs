@@ -162,6 +162,52 @@ fn assert_config_error(run: &BrRun, needle: &str, context: &str) {
     );
 }
 
+fn assert_database_authority_failure(run: &BrRun, context: &str) {
+    assert!(
+        !run.status.success(),
+        "{context} should fail\nstdout={}\nstderr={}",
+        run.stdout,
+        run.stderr
+    );
+    let error_json = parse_stdout_json(run, context);
+    assert_eq!(
+        error_json["error"]["code"].as_str(),
+        Some("SYNC_CONFLICT"),
+        "{context} should surface SYNC_CONFLICT: {error_json}"
+    );
+    assert!(
+        error_json["error"]["message"].as_str().is_some_and(
+            |message| message.contains("pending sync-merge state could not be inspected")
+        ),
+        "{context} should refuse an unverified database-family authority handoff: {error_json}"
+    );
+}
+
+fn assert_doctor_authority_failure(run: &BrRun, context: &str) {
+    assert!(
+        !run.status.success(),
+        "{context} should fail\nstdout={}\nstderr={}",
+        run.stdout,
+        run.stderr
+    );
+    let error_json = parse_stdout_json(run, context);
+    assert_eq!(
+        error_json["code"].as_str(),
+        Some("refused_unsafe"),
+        "{context} should surface doctor's fail-closed refusal: {error_json}"
+    );
+    assert_eq!(
+        error_json["gate"].as_str(),
+        Some("sync.merge_pending"),
+        "{context} should identify the unprovable pending-merge gate: {error_json}"
+    );
+    assert_eq!(
+        error_json["evidence"]["pending"].as_str(),
+        Some("unknown"),
+        "{context} should preserve pending-merge uncertainty: {error_json}"
+    );
+}
+
 fn first_issue_id(list_json: &Value) -> String {
     list_json["issues"]
         .as_array()
@@ -482,6 +528,12 @@ fn assert_surface_outcome(
         WorkspaceFailureCommandOutcome::FailsInvalidJson => {
             assert_config_error(&run, "invalid issue record", &context);
         }
+        WorkspaceFailureCommandOutcome::FailsDatabaseAuthority => {
+            assert_database_authority_failure(&run, &context);
+        }
+        WorkspaceFailureCommandOutcome::FailsDoctorAuthority => {
+            assert_doctor_authority_failure(&run, &context);
+        }
         WorkspaceFailureCommandOutcome::FailsRepeatedRepair => {
             assert_config_error(&run, "--allow-repeated-repair", &context);
         }
@@ -546,7 +598,7 @@ fn assert_core_read_success(fixture: &FixtureWorkspace) {
 
 fn assert_core_read_failure(
     fixture: &FixtureWorkspace,
-    where_json: &Value,
+    jsonl_path: &Path,
     failure: WorkspaceFailureCommandOutcome,
 ) {
     let list_workspace = fixture_workspace(&fixture.metadata.name);
@@ -573,14 +625,16 @@ fn assert_core_read_failure(
                 &format!("{} core ready", fixture.metadata.name),
             );
         }
+        WorkspaceFailureCommandOutcome::FailsDatabaseAuthority => {
+            assert_database_authority_failure(
+                &ready,
+                &format!("{} core ready", fixture.metadata.name),
+            );
+        }
         _ => unreachable!(),
     }
 
-    let jsonl_path = where_json["jsonl_path"]
-        .as_str()
-        .map(PathBuf::from)
-        .expect("where jsonl_path");
-    let issue_id = first_issue_id_from_jsonl(&jsonl_path);
+    let issue_id = first_issue_id_from_jsonl(jsonl_path);
     let show_workspace = fixture_workspace(&fixture.metadata.name);
     let show = run_br(
         &show_workspace.workspace,
@@ -599,6 +653,12 @@ fn assert_core_read_failure(
             assert_config_error(
                 &show,
                 "conflict marker",
+                &format!("{} core show", fixture.metadata.name),
+            );
+        }
+        WorkspaceFailureCommandOutcome::FailsDatabaseAuthority => {
+            assert_database_authority_failure(
+                &show,
                 &format!("{} core show", fixture.metadata.name),
             );
         }
@@ -729,6 +789,12 @@ fn assert_core_write_failure(
                 &format!("{} core create", fixture.metadata.name),
             );
         }
+        WorkspaceFailureCommandOutcome::FailsDatabaseAuthority => {
+            assert_database_authority_failure(
+                create,
+                &format!("{} core create", fixture.metadata.name),
+            );
+        }
         other => unreachable!(
             "{} has unsupported create outcome for core write replay: {:?}",
             fixture.metadata.name, other
@@ -780,51 +846,78 @@ fn workspace_failure_replay_core_read_surfaces_match_expected_posture() {
     let fixtures = list_workspace_failure_fixtures().expect("fixture catalog");
 
     for fixture in fixtures {
+        let startup_outcome = fixture
+            .metadata
+            .outcome_for("startup/open")
+            .expect("startup/open expectation");
         let where_workspace = fixture_workspace(&fixture.metadata.name);
         let where_run = run_br(
             &where_workspace.workspace,
             ["where", "--json"],
             &surface_label(&fixture.metadata.name, "core_where"),
         );
-        assert!(
-            where_run.status.success(),
-            "{} where --json failed: {}",
-            fixture.metadata.name,
-            where_run.stderr
-        );
-        let where_json =
-            parse_stdout_json(&where_run, &format!("{} core where", fixture.metadata.name));
-
         let info_workspace = fixture_workspace(&fixture.metadata.name);
         let info = run_br(
             &info_workspace.workspace,
             ["info", "--json"],
             &surface_label(&fixture.metadata.name, "core_info"),
         );
-        assert!(
-            info.status.success(),
-            "{} info --json failed: {}",
-            fixture.metadata.name,
-            info.stderr
-        );
-        let _info_json = parse_stdout_json(&info, &format!("{} core info", fixture.metadata.name));
-
-        match fixture
-            .metadata
-            .outcome_for("startup/open")
-            .expect("startup/open expectation")
-        {
+        match startup_outcome {
             WorkspaceFailureCommandOutcome::Success
             | WorkspaceFailureCommandOutcome::SuccessWithAutoRecovery => {
+                assert!(
+                    where_run.status.success(),
+                    "{} where --json failed: {}",
+                    fixture.metadata.name,
+                    where_run.stderr
+                );
+                let _where_json =
+                    parse_stdout_json(&where_run, &format!("{} core where", fixture.metadata.name));
+                assert!(
+                    info.status.success(),
+                    "{} info --json failed: {}",
+                    fixture.metadata.name,
+                    info.stderr
+                );
+                let _info_json =
+                    parse_stdout_json(&info, &format!("{} core info", fixture.metadata.name));
                 assert_core_read_success(&where_workspace);
             }
             WorkspaceFailureCommandOutcome::FailsPrefixMismatch
             | WorkspaceFailureCommandOutcome::FailsConflictMarkers => {
-                let failure = fixture
-                    .metadata
-                    .outcome_for("startup/open")
-                    .expect("startup/open failure");
-                assert_core_read_failure(&where_workspace, &where_json, failure);
+                assert!(
+                    where_run.status.success(),
+                    "{} where --json failed: {}",
+                    fixture.metadata.name,
+                    where_run.stderr
+                );
+                let where_json =
+                    parse_stdout_json(&where_run, &format!("{} core where", fixture.metadata.name));
+                assert!(
+                    info.status.success(),
+                    "{} info --json failed: {}",
+                    fixture.metadata.name,
+                    info.stderr
+                );
+                let _info_json =
+                    parse_stdout_json(&info, &format!("{} core info", fixture.metadata.name));
+                let jsonl_path = where_json["jsonl_path"]
+                    .as_str()
+                    .map(PathBuf::from)
+                    .expect("where jsonl_path");
+                assert_core_read_failure(&where_workspace, &jsonl_path, startup_outcome);
+            }
+            WorkspaceFailureCommandOutcome::FailsDatabaseAuthority => {
+                assert_database_authority_failure(
+                    &where_run,
+                    &format!("{} core where", fixture.metadata.name),
+                );
+                assert_database_authority_failure(
+                    &info,
+                    &format!("{} core info", fixture.metadata.name),
+                );
+                let jsonl_path = where_workspace.beads_dir.join("issues.jsonl");
+                assert_core_read_failure(&where_workspace, &jsonl_path, startup_outcome);
             }
             other => unreachable!(
                 "{} has unsupported startup/open outcome for core read replay: {:?}",
@@ -865,7 +958,8 @@ fn workspace_failure_replay_core_write_surfaces_match_expected_posture() {
                 assert_core_write_success(&workspace, &create, expected_create);
             }
             WorkspaceFailureCommandOutcome::FailsPrefixMismatch
-            | WorkspaceFailureCommandOutcome::FailsConflictMarkers => {
+            | WorkspaceFailureCommandOutcome::FailsConflictMarkers
+            | WorkspaceFailureCommandOutcome::FailsDatabaseAuthority => {
                 assert_core_write_failure(&workspace, &create, expected_create);
             }
             other => unreachable!(
@@ -892,7 +986,10 @@ fn infer_classification(metadata: &WorkspaceFailureFixtureMetadata) -> &'static 
     );
     let startup_needs_recovery = matches!(
         startup,
-        Some(WorkspaceFailureCommandOutcome::SuccessWithAutoRecovery)
+        Some(
+            WorkspaceFailureCommandOutcome::SuccessWithAutoRecovery
+                | WorkspaceFailureCommandOutcome::FailsDatabaseAuthority
+        )
     );
     let doctor_reports_errors =
         matches!(doctor, Some(WorkspaceFailureCommandOutcome::ReportsErrors));

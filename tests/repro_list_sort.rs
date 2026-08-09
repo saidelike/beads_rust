@@ -1,8 +1,12 @@
 use assert_cmd::Command;
 
+#[allow(dead_code)]
+#[path = "common/cli.rs"]
+mod common_cli;
+
 #[test]
 fn test_list_sort_title_case_insensitive() {
-    let temp = tempfile::tempdir().unwrap();
+    let temp = tempfile::TempDir::new_in(common_cli::isolated_temp_root()).unwrap();
     let path = temp.path();
 
     // Init

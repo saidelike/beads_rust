@@ -180,9 +180,13 @@ fn execute_close_eligible(
 
     let now = Utc::now();
     let reason = "All children completed";
-    let closed_ids = close_eligible_epics_atomically(
+    let eligible_ids: Vec<String> = epics
+        .iter()
+        .map(|epic_status| epic_status.epic.id.clone())
+        .collect();
+    let closed_ids = close_eligible_containers_atomically(
         storage,
-        &epics,
+        &eligible_ids,
         &actor,
         now,
         reason,
@@ -225,19 +229,19 @@ fn execute_close_eligible(
     Ok(())
 }
 
-fn close_eligible_epics_atomically(
+fn close_eligible_containers_atomically(
     storage: &mut SqliteStorage,
-    epics: &[EpicStatus],
+    ids: &[String],
     actor: &str,
     now: chrono::DateTime<Utc>,
     reason: &str,
     transition_comment: Option<&str>,
 ) -> Result<Vec<String>> {
-    let updates = epics
+    let updates = ids
         .iter()
-        .map(|epic_status| {
+        .map(|id| {
             (
-                epic_status.epic.id.clone(),
+                id.clone(),
                 IssueUpdate {
                     status: Some(Status::Closed),
                     closed_at: Some(Some(now)),
@@ -720,9 +724,10 @@ mod tests {
         );
         storage.set_workflow_capacity_policy(policy);
 
-        let error = close_eligible_epics_atomically(
+        let eligible_ids: Vec<String> = epics.iter().map(|epic| epic.epic.id.clone()).collect();
+        let error = close_eligible_containers_atomically(
             &mut storage,
-            &epics,
+            &eligible_ids,
             "tester",
             Utc::now(),
             "All children completed",
@@ -747,9 +752,9 @@ mod tests {
         );
         storage.set_workflow_capacity_policy(policy);
 
-        let closed = close_eligible_epics_atomically(
+        let closed = close_eligible_containers_atomically(
             &mut storage,
-            &epics,
+            &eligible_ids,
             "tester",
             Utc::now(),
             "All children completed",

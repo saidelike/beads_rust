@@ -1,21 +1,23 @@
-use beads_rust::cli::ListArgs;
-use beads_rust::cli::commands::list;
-use beads_rust::config::CliOverrides;
-use beads_rust::output::OutputContext;
+use assert_cmd::Command;
+
+#[allow(dead_code)]
+#[path = "common/cli.rs"]
+mod common_cli;
 
 #[test]
 fn test_list_sort_aliases_are_accepted() {
-    let args = ListArgs {
-        sort: Some("created".to_string()),
-        ..Default::default()
-    };
-    let overrides = CliOverrides::default();
-    let ctx = OutputContext::from_flags(false, false, true);
+    let temp = tempfile::TempDir::new_in(common_cli::isolated_temp_root()).unwrap();
+    let bin = assert_cmd::cargo::cargo_bin!("br");
 
-    // This should now SUCCEED
-    let result = list::execute(&args, false, &overrides, &ctx);
+    Command::new(&bin)
+        .current_dir(temp.path())
+        .arg("init")
+        .assert()
+        .success();
 
-    if let Err(e) = result {
-        panic!("Expected Ok, got {e:?}");
-    }
+    Command::new(&bin)
+        .current_dir(temp.path())
+        .args(["list", "--sort", "created", "--json"])
+        .assert()
+        .success();
 }

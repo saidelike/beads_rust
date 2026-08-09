@@ -15,6 +15,7 @@
 
 mod common;
 
+use common::cli::isolated_temp_root;
 use common::{
     BaselineStore, DatasetIntegrityGuard, DatasetMetadata, DatasetRegistry, KnownDataset,
     RegressionConfig, RegressionResult, RegressionSummary, init_test_logging,
@@ -92,7 +93,7 @@ impl DatasetBenchmarkWorkspace {
             ));
         }
 
-        let temp_dir = tempfile::TempDir::new()?;
+        let temp_dir = tempfile::TempDir::new_in(isolated_temp_root())?;
         let root = temp_dir.path();
 
         let br_root = root.join("br_workspace");
@@ -149,7 +150,7 @@ impl DatasetBenchmarkWorkspace {
 
     /// Create empty workspaces for init benchmarks
     pub fn empty() -> std::io::Result<Self> {
-        let temp_dir = tempfile::TempDir::new()?;
+        let temp_dir = tempfile::TempDir::new_in(isolated_temp_root())?;
         let root = temp_dir.path();
 
         let br_root = root.join("br_workspace");

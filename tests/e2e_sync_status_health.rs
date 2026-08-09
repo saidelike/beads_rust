@@ -17,36 +17,6 @@ use serde_json::Value;
 use std::collections::BTreeMap;
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
-use std::path::Path;
-use std::process::Command;
-
-fn git(root: &Path, args: &[&str]) -> std::process::Output {
-    Command::new("git")
-        .args([
-            "-c",
-            "user.name=br-e2e",
-            "-c",
-            "user.email=br-e2e@example.invalid",
-            "-c",
-            "commit.gpgsign=false",
-        ])
-        .args(args)
-        .current_dir(root)
-        .env("HOME", root)
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .output()
-        .expect("run git")
-}
-
-fn git_ok(root: &Path, args: &[&str]) {
-    let out = git(root, args);
-    assert!(
-        out.status.success(),
-        "git {args:?} failed: {}{}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr)
-    );
-}
 
 fn sync_status_json(workspace: &BrWorkspace, label: &str) -> Value {
     let status = run_br(workspace, ["sync", "--status", "--json"], label);

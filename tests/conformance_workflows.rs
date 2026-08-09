@@ -16,7 +16,7 @@
 
 mod common;
 
-use common::cli::extract_json_payload;
+use common::cli::{extract_json_payload, isolated_temp_root};
 use serde::Serialize;
 use serde_json::Value;
 use std::collections::HashSet;
@@ -376,7 +376,7 @@ pub struct WorkflowStep {
 
 impl WorkflowWorkspace {
     pub fn new(_name: &str) -> Self {
-        let temp_dir = TempDir::new().expect("create temp dir");
+        let temp_dir = TempDir::new_in(isolated_temp_root()).expect("create isolated temp dir");
         let root = temp_dir.path().to_path_buf();
         let br_root = root.join("br_workspace");
         let bd_root = root.join("bd_workspace");

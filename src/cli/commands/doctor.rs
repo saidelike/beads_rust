@@ -162,7 +162,7 @@ impl PendingSyncMergeState {
         }
     }
 
-    fn legacy(metadata_key: String, row_count: usize, diagnostic: String) -> Self {
+    fn legacy(metadata_key: String, row_count: usize, diagnostic: &str) -> Self {
         Self {
             condition: PendingSyncMergeCondition::Legacy,
             metadata_key,
@@ -196,7 +196,7 @@ impl PendingSyncMergeState {
                 metadata_key,
                 row_count,
                 diagnostic,
-            } => Some(Self::legacy(metadata_key, row_count, diagnostic)),
+            } => Some(Self::legacy(metadata_key, row_count, &diagnostic)),
             PendingSyncMergeInspection::Malformed {
                 metadata_key,
                 diagnostic,
@@ -686,6 +686,7 @@ fn emit_refused_unsafe(
 fn refuse_doctor_mutation_if_merge_pending(
     operation: &str,
     db_path: &Path,
+    recovery_jsonl_path: Option<&Path>,
     authority: &Arc<crate::sync::DatabaseFamilyWriteLock>,
     ctx: &OutputContext,
 ) {
@@ -705,6 +706,24 @@ fn refuse_doctor_mutation_if_merge_pending(
                 "remediation": "Run `br sync --merge`, verify that it clears the pending receipt, then rerun the requested doctor operation."
             });
             (reason, evidence)
+        }
+        Err(_)
+            if recovery_jsonl_path.is_some_and(|jsonl_path| {
+                command_owned_jsonl_recovery_may_replace_empty_database_family(
+                    db_path, jsonl_path, authority,
+                )
+            }) =>
+        {
+            return;
+        }
+        Err(BeadsError::SchemaMismatch { found, .. })
+            if crate::storage::schema::schema_version_predates_reviewed_migrations(found) =>
+        {
+            tracing::info!(
+                schema_version = found,
+                "Database predates pending sync-merge receipts; allowing doctor mutation under held database-family authority"
+            );
+            return;
         }
         Err(error) => {
             let reason = format!(
@@ -1085,6 +1104,102 @@ pub fn inspect_pending_sync_merge_under_authority(
     Ok(PendingSyncMergeState::from_inspection(
         SqliteStorage::inspect_pending_sync_merge_under_authority(db_path, authority)?,
     ))
+}
+
+/// Return whether an explicit command that preserves and restores the exact
+/// database family may take over an uninspectable database.
+///
+/// This broader contract is reserved for the reviewed rename-prefix import
+/// lifecycle. Generic doctor repair uses the narrower empty-family predicate
+/// below because it cannot assume the same deferred recovery transaction.
+#[must_use]
+pub fn command_owned_recovery_may_replace_uninspectable_database(
+    db_path: &Path,
+    authority: &Arc<crate::sync::DatabaseFamilyWriteLock>,
+) -> bool {
+    let Ok(planned_authority) = crate::sync::database_write_authority_sha256(db_path) else {
+        return false;
+    };
+    if planned_authority != authority.authority_path_sha256() {
+        return false;
+    }
+
+    let Ok(database_was_missing) = authority.bind_database_inode_for_mutation() else {
+        return false;
+    };
+    if database_was_missing {
+        return authority.verify_database_authority().is_ok();
+    }
+    if authority.verify_database_authority().is_err() {
+        return false;
+    }
+
+    let unavailable = matches!(SqliteStorage::open_current_read_only(db_path), Ok(None));
+    unavailable && authority.verify_database_authority().is_ok()
+}
+
+/// Return whether explicit, command-owned JSONL recovery may replace an empty
+/// database family whose pending-merge state cannot be inspected.
+///
+/// This is intentionally narrower than treating an inspection error as an
+/// absent receipt. A current-schema database remains inspectable and must use
+/// the normal pending-merge gate. A nonempty database or classic SQLite
+/// sidecar may still contain unreconciled state and therefore fails closed.
+/// Only an entirely missing/zero-length family plus an immutable, validated
+/// JSONL source can cross this recovery boundary.
+#[must_use]
+pub fn command_owned_jsonl_recovery_may_replace_empty_database_family(
+    db_path: &Path,
+    jsonl_path: &Path,
+    authority: &Arc<crate::sync::DatabaseFamilyWriteLock>,
+) -> bool {
+    let Ok(planned_authority) = crate::sync::database_write_authority_sha256(db_path) else {
+        return false;
+    };
+    if planned_authority != authority.authority_path_sha256() {
+        return false;
+    }
+
+    let Ok(database_was_missing) = authority.bind_database_inode_for_mutation() else {
+        return false;
+    };
+    if authority.verify_database_authority().is_err() {
+        return false;
+    }
+
+    let database_is_safe_recovery_input = match fs::symlink_metadata(db_path) {
+        Err(error) => database_was_missing && error.kind() == io::ErrorKind::NotFound,
+        Ok(metadata) => {
+            !database_was_missing
+                && metadata.is_file()
+                && !metadata.file_type().is_symlink()
+                && metadata.len() == 0
+        }
+    };
+    if !database_is_safe_recovery_input {
+        return false;
+    }
+
+    let classic_sidecars_are_empty = [
+        sqlite_wal_sidecar_path(db_path),
+        sqlite_shm_sidecar_path(db_path),
+        sqlite_journal_sidecar_path(db_path),
+    ]
+    .iter()
+    .all(|sidecar| match fs::symlink_metadata(sidecar) {
+        Err(error) => error.kind() == io::ErrorKind::NotFound,
+        Ok(metadata) => {
+            metadata.is_file() && !metadata.file_type().is_symlink() && metadata.len() == 0
+        }
+    });
+    if !classic_sidecars_are_empty {
+        return false;
+    }
+
+    let jsonl_is_valid_recovery_authority = capture_jsonl_source_snapshot(jsonl_path)
+        .and_then(|source| preflight_jsonl_rebuild_authority(&source))
+        .is_ok();
+    jsonl_is_valid_recovery_authority && authority.verify_database_authority().is_ok()
 }
 
 fn check_pending_sync_merge(db_path: &Path, checks: &mut Vec<CheckResult>) {
@@ -5624,7 +5739,7 @@ fn check_inner_gitignore_present(beads_dir: &Path, checks: &mut Vec<CheckResult>
     let missing: Vec<&str> = EXPECTED_PATTERNS
         .iter()
         .copied()
-        .filter(|needle| !contents.lines().map(str::trim).any(|line| line == *needle))
+        .filter(|needle| !inner_gitignore_covers_path(&contents, needle))
         .collect();
     if missing.is_empty() {
         push_check(
@@ -5651,6 +5766,54 @@ fn check_inner_gitignore_present(beads_dir: &Path, checks: &mut Vec<CheckResult>
             })),
         );
     }
+}
+
+fn inner_gitignore_covers_path(contents: &str, path: &str) -> bool {
+    let mut ignored = false;
+    for raw_line in contents.lines() {
+        let line = raw_line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let (negated, pattern) = line
+            .strip_prefix('!')
+            .map_or((false, line), |pattern| (true, pattern));
+        let pattern = pattern.strip_prefix('/').unwrap_or(pattern);
+        if pattern.ends_with('/') || pattern.contains('/') {
+            continue;
+        }
+        if wildcard_matches(pattern, path) {
+            ignored = !negated;
+        }
+    }
+    ignored
+}
+
+fn wildcard_matches(pattern: &str, value: &str) -> bool {
+    let mut matches = vec![false; value.chars().count() + 1];
+    matches[0] = true;
+    let value: Vec<char> = value.chars().collect();
+    for pattern_char in pattern.chars() {
+        let previous = matches.clone();
+        match pattern_char {
+            '*' => {
+                for index in 1..=value.len() {
+                    matches[index] = previous[index] || matches[index - 1];
+                }
+            }
+            '?' => {
+                matches[0] = false;
+                matches[1..=value.len()].copy_from_slice(&previous[..value.len()]);
+            }
+            literal => {
+                matches[0] = false;
+                for index in 1..=value.len() {
+                    matches[index] = previous[index - 1] && value[index - 1] == literal;
+                }
+            }
+        }
+    }
+    matches[value.len()]
 }
 
 /// Pass-5 cycle 27 — fixer for the missing/incomplete subset of
@@ -5706,7 +5869,7 @@ fn fix_inner_gitignore_if_warned(
     let missing: Vec<&str> = EXPECTED_PATTERNS
         .iter()
         .copied()
-        .filter(|needle| !existing.lines().map(str::trim).any(|line| line == *needle))
+        .filter(|needle| !inner_gitignore_covers_path(&existing, needle))
         .collect();
     if missing.is_empty() {
         return false;
@@ -6146,7 +6309,7 @@ fn fix_db_sidecar_modes_if_warned(
             let current = meta.permissions().mode();
             // Already owner-only — TOCTOU defense (the storage layer may have
             // self-healed it between detection and repair).
-            if (current & 0o077) == 0 {
+            if current.trailing_zeros() >= 6 {
                 continue;
             }
             let new_mode = current & !0o077;
@@ -9455,6 +9618,7 @@ fn push_write_lock_fresh(
             "path": lock_path.display().to_string(),
             "age_secs": age_secs,
             "threshold_secs": threshold_secs,
+            "reason": "persistent_advisory_inode",
         })),
     );
 }
@@ -11175,6 +11339,8 @@ fn check_sync_metadata(
 /// "index <name> contains rowid N for a table row that does not
 /// satisfy the partial index predicate" — that's older SQLite not
 /// validating partial predicates on `integrity_check`.
+// Keep the snapshot, transaction, rollback, and authority checks contiguous for auditability.
+#[allow(clippy::too_many_lines)]
 fn execute_repair_indexes(
     beads_dir: &Path,
     paths: &config::ConfigPaths,
@@ -11203,15 +11369,6 @@ fn execute_repair_indexes(
         }
     };
 
-    if !args.dry_run {
-        refuse_doctor_mutation_if_merge_pending(
-            "--repair-indexes",
-            &paths.db_path,
-            &write_authority,
-            ctx,
-        );
-    }
-
     match refuse_gates::run_all(beads_dir, &paths.db_path) {
         GateOutcome::Allow => {}
         GateOutcome::Refuse {
@@ -11222,6 +11379,16 @@ fn execute_repair_indexes(
             emit_refused_unsafe("--repair-indexes", &reason, &evidence, ctx);
             std::process::exit(DoctorExitCode::RefusedUnsafe.as_i32());
         }
+    }
+
+    if !args.dry_run {
+        refuse_doctor_mutation_if_merge_pending(
+            "--repair-indexes",
+            &paths.db_path,
+            None,
+            &write_authority,
+            ctx,
+        );
     }
 
     // Pre-snapshot backup. Same shape `--repair` uses: copy the live
@@ -12216,6 +12383,7 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
             refuse_doctor_mutation_if_merge_pending(
                 "doctor undo",
                 &paths.db_path,
+                None,
                 &write_authority,
                 ctx,
             );
@@ -12370,13 +12538,6 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
         None
     };
 
-    if args.repair && !args.dry_run && !args.robot_triage {
-        let write_authority = repair_write_authority
-            .as_ref()
-            .expect("repair write authority acquired before pending-merge gate");
-        refuse_doctor_mutation_if_merge_pending("--repair", &paths.db_path, write_authority, ctx);
-    }
-
     // Round-5 fresh-eyes follow-through (`beads_rust-73ux`): the WP1
     // refuse-unsafe gates (schema-version-downgrade,
     // recovery-fingerprint-integrity) must run BEFORE any
@@ -12400,6 +12561,21 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
                 std::process::exit(DoctorExitCode::RefusedUnsafe.as_i32());
             }
         }
+    }
+
+    if args.repair && !args.dry_run && !args.robot_triage {
+        let Some(write_authority) = repair_write_authority.as_ref() else {
+            return Err(BeadsError::internal(
+                "repair write authority was not acquired before pending-merge gate",
+            ));
+        };
+        refuse_doctor_mutation_if_merge_pending(
+            "--repair",
+            &paths.db_path,
+            Some(&paths.jsonl_path),
+            write_authority,
+            ctx,
+        );
     }
 
     // --repair-indexes (#288): REINDEX-only recovery path, strictly
@@ -13575,6 +13751,7 @@ mod tests {
             kept_issue_witnesses: Vec::new(),
             deleted_issue_ids: Vec::new(),
             note_witnesses: Vec::new(),
+            sequence_numbers: Vec::new(),
             database_before,
         };
         let database_after =

@@ -3,6 +3,7 @@
 mod common;
 
 use common::cli::{BrWorkspace, extract_issues_array, extract_json_payload, run_br};
+use fsqlite::{Connection, SqliteValue};
 use serde_json::Value;
 use std::fs;
 use tracing::info;
@@ -16,6 +17,35 @@ fn parse_created_id(stdout: &str) -> String {
         .and_then(|rest| rest.split(':').next())
         .unwrap_or("");
     id_part.trim().to_string()
+}
+
+/// Seed a genuine blocking cycle as a legacy/corruption fixture.
+///
+/// The public `dep add` path correctly rejects the closing edge, so cycle
+/// reporting E2E tests must bypass that mutation gate to exercise databases
+/// that already contain a blocking cycle.
+fn inject_blocking_cycle(workspace: &BrWorkspace, issue_a_id: &str, issue_b_id: &str) {
+    let connection = Connection::open(
+        workspace
+            .root
+            .join(".beads/beads.db")
+            .to_string_lossy()
+            .into_owned(),
+    )
+    .expect("open cycle fixture database");
+    for (issue_id, depends_on_id) in [(issue_a_id, issue_b_id), (issue_b_id, issue_a_id)] {
+        connection
+            .execute_with_params(
+                "INSERT INTO dependencies (issue_id, depends_on_id, type, created_at) \
+                 VALUES (?, ?, 'blocks', '2026-01-01T00:00:00Z')",
+                &[
+                    SqliteValue::from(issue_id),
+                    SqliteValue::from(depends_on_id),
+                ],
+            )
+            .expect("insert blocking cycle edge");
+    }
+    connection.close().expect("close cycle fixture database");
 }
 
 #[test]
@@ -43,26 +73,7 @@ fn e2e_dep_cycles_default_hides_closed_archive_and_include_closed_exposes_it() {
     );
     let issue_b_id = parse_created_id(&issue_b.stdout);
 
-    let add_a_b = run_br(
-        &workspace,
-        ["dep", "add", &issue_a_id, &issue_b_id, "-t", "related"],
-        "add_a_b_related",
-    );
-    assert!(
-        add_a_b.status.success(),
-        "add A->B failed: {}",
-        add_a_b.stderr
-    );
-    let add_b_a = run_br(
-        &workspace,
-        ["dep", "add", &issue_b_id, &issue_a_id, "-t", "related"],
-        "add_b_a_related",
-    );
-    assert!(
-        add_b_a.status.success(),
-        "add B->A failed: {}",
-        add_b_a.stderr
-    );
+    inject_blocking_cycle(&workspace, &issue_a_id, &issue_b_id);
 
     let close_a = run_br(&workspace, ["close", &issue_a_id], "close_a");
     assert!(
@@ -157,29 +168,7 @@ fn e2e_dep_cycles_active_cycle_exits_nonzero() {
     );
     let issue_b_id = parse_created_id(&issue_b.stdout);
 
-    // `related` edges can close a cycle without br refusing the edge (only
-    // `blocks` cycles are rejected at insert time), leaving an active cycle the
-    // detector reports.
-    let add_a_b = run_br(
-        &workspace,
-        ["dep", "add", &issue_a_id, &issue_b_id, "-t", "related"],
-        "add_a_b_related",
-    );
-    assert!(
-        add_a_b.status.success(),
-        "add A->B failed: {}",
-        add_a_b.stderr
-    );
-    let add_b_a = run_br(
-        &workspace,
-        ["dep", "add", &issue_b_id, &issue_a_id, "-t", "related"],
-        "add_b_a_related",
-    );
-    assert!(
-        add_b_a.status.success(),
-        "add B->A failed: {}",
-        add_b_a.stderr
-    );
+    inject_blocking_cycle(&workspace, &issue_a_id, &issue_b_id);
 
     // JSON surface: cycle data preserved AND non-zero exit.
     let json = run_br(&workspace, ["dep", "cycles", "--json"], "cycles_json");

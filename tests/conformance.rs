@@ -8,7 +8,7 @@ mod common;
 
 use assert_cmd::Command;
 use chrono::Utc;
-use common::cli::extract_json_payload;
+use common::cli::{extract_json_payload, isolated_temp_root};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use serde_yml::Value as YamlValue;
@@ -87,7 +87,7 @@ impl ConformanceWorkspace {
     const INIT_ARGS: [&'static str; 3] = ["init", "--prefix", CONFORMANCE_PREFIX];
 
     pub fn new() -> Self {
-        let temp_dir = TempDir::new().expect("create temp dir");
+        let temp_dir = TempDir::new_in(isolated_temp_root()).expect("create isolated temp dir");
         let root = temp_dir.path().to_path_buf();
         let br_root = root.join("br_workspace");
         let bd_root = root.join("bd_workspace");

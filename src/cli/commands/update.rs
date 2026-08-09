@@ -412,10 +412,12 @@ fn prepare_single_route(
 ) -> Result<PreparedUpdateRoute> {
     let routed_write_lock =
         acquire_routed_workspace_write_lock(beads_dir, auto_flush_external, cli.lock_timeout)?;
-    let mut storage_ctx = config::open_storage_with_cli(beads_dir, cli)?;
-    auto_import_storage_ctx_if_stale(&mut storage_ctx, cli)?;
+    let mut route_cli = cli.clone();
+    routed_write_lock.mark_cli_write_lock_held(&mut route_cli);
+    let mut storage_ctx = config::open_storage_with_cli(beads_dir, &route_cli)?;
+    auto_import_storage_ctx_if_stale(&mut storage_ctx, &route_cli)?;
 
-    let config_layer = storage_ctx.load_config(cli)?;
+    let config_layer = storage_ctx.load_config(&route_cli)?;
     let actor = config::resolve_actor(&config_layer);
     let resolver = build_resolver(&config_layer, &storage_ctx.storage);
     let resolved_ids = resolve_target_ids(args, beads_dir, &resolver, &storage_ctx.storage)?;

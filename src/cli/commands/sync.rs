@@ -31,7 +31,7 @@ use crate::sync::{
     export_temp_path, export_to_jsonl_with_policy_expected_under_authorities,
     export_to_jsonl_with_policy_expected_under_authority, finalize_export_under_authority,
     get_issue_ids_from_jsonl_snapshot, id_matches_expected_prefix, import_from_jsonl_snapshot,
-    load_base_snapshot_from_source, plan_reviewed_additive_reconcile, plan_sync_reconcile,
+    plan_reviewed_additive_reconcile, plan_sync_reconcile, read_issue_records_from_jsonl_snapshot,
     read_issues_from_jsonl_snapshot, refresh_base_snapshot_from_flushed_jsonl_snapshot,
     refresh_base_snapshot_from_flushed_jsonl_snapshot_under_authority,
     require_safe_sync_overwrite_path, require_valid_sync_path, restore_tombstones_after_rebuild,
@@ -60,6 +60,9 @@ fn human_witness_value_digest(value: Option<&str>) -> (usize, String) {
     }
 }
 
+// Audited formatter: keeping every bounded witness class together preserves
+// the receipt's ordering and truncation contract.
+#[allow(clippy::too_many_lines)]
 fn additive_conflict_human_lines(
     receipt: &AdditiveReconcileReceipt,
     witness_limit: usize,
@@ -698,6 +701,9 @@ fn should_defer_jsonl_recovery(args: &SyncArgs) -> bool {
 /// `--merge --rebuild` combination must return an error without having
 /// touched the DB family — otherwise the validation message arrives after
 /// `recover_database_from_jsonl` has already moved the existing DB aside.
+// Audited validation matrix: each branch rejects one CLI combination before
+// storage is opened, so splitting it would obscure the side-effect boundary.
+#[allow(clippy::too_many_lines)]
 pub fn validate_sync_mode_args(args: &SyncArgs) -> Result<()> {
     if args.apply && !args.reconcile_additive {
         return Err(BeadsError::Validation {
@@ -1086,7 +1092,7 @@ fn finalize_sync_dispatch_completion(
             &mut open_result.storage,
             &open_result.paths.db_path,
             published_source,
-            pending_merge,
+            &pending_merge,
             open_result.no_db,
         )
         .map_err(|source| BeadsError::CommittedStateUnwitnessed {
@@ -1105,7 +1111,7 @@ fn finalize_pending_sync_merge_after_adoption(
     storage: &mut crate::storage::SqliteStorage,
     db_path: &Path,
     published_source: &JsonlSourceSnapshot,
-    pending: PendingSyncMergeCompletion,
+    pending: &PendingSyncMergeCompletion,
     no_db: bool,
 ) -> Result<()> {
     let receipt = &pending.receipt;
@@ -1282,6 +1288,9 @@ fn sync_operation(args: &SyncArgs) -> SyncOperation {
     }
 }
 
+// Audited renderer: one linear function keeps the human receipt in the same
+// deterministic order as its machine-readable counterpart.
+#[allow(clippy::too_many_lines)]
 fn render_additive_reconcile_receipt(
     receipt: &AdditiveReconcileReceipt,
     ctx: &OutputContext,
@@ -2400,7 +2409,32 @@ fn execute_flush(
         "Exported issues to JSONL"
     );
 
-    // Finalize export (clear dirty flags, update metadata)
+    // A clean flush leaves DB == JSONL, so the JSONL that just reached disk
+    // is the new common state future 3-way merges should diff against.
+    // Refresh the merge anchor to match (issue #378): historically only the
+    // merge path wrote `beads.base.jsonl`, leaving flush-only workspaces
+    // permanently anchor-less and tripping the doctor's
+    // `base_jsonl.missing_post_flush` warning while `br sync --status`
+    // reported "In sync". Skip when the export had per-record errors — a
+    // partial export must not become the merge base. The anchor must be
+    // durable before export metadata is finalized so a failed anchor write
+    // leaves the database dirty and the published JSONL safely retryable.
+    if !report.has_errors() {
+        let anchor_path = path_policy.beads_dir.join("beads.base.jsonl");
+        refresh_base_snapshot_from_flushed_jsonl_snapshot(
+            export_result.published_source()?,
+            &path_policy.beads_dir,
+        )
+        .map_err(|source| BeadsError::CommittedArtifactFailure {
+            operation: "flush".to_string(),
+            primary_path: jsonl_path.clone(),
+            artifact_path: anchor_path,
+            source: Box::new(source),
+        })?;
+    }
+
+    // Finalize export (clear dirty flags, update metadata) only after every
+    // required publication for a clean flush is durable.
     finalize_export_under_authority(
         storage,
         &export_result,
@@ -2413,27 +2447,6 @@ fn execute_flush(
         source: Box::new(source),
     })?;
     info!("Export complete, cleared dirty flags");
-
-    // A clean flush leaves DB == JSONL, so the JSONL that just reached disk
-    // is the new common state future 3-way merges should diff against.
-    // Refresh the merge anchor to match (issue #378): historically only the
-    // merge path wrote `beads.base.jsonl`, leaving flush-only workspaces
-    // permanently anchor-less and tripping the doctor's
-    // `base_jsonl.missing_post_flush` warning while `br sync --status`
-    // reported "In sync". Skip when the export had per-record errors — a
-    // partial export must not become the merge base. Best-effort: a failed
-    // anchor write must not fail an otherwise durable flush.
-    if !report.has_errors()
-        && let Err(error) = refresh_base_snapshot_from_flushed_jsonl_snapshot(
-            export_result.published_source()?,
-            &path_policy.beads_dir,
-        )
-    {
-        warn!(
-            error = %error,
-            "Failed to refresh merge anchor after flush; `br doctor` may report base_jsonl findings"
-        );
-    }
 
     // Write manifest if requested (atomic: temp + fsync + durable_rename)
     let manifest_path = if args.manifest {
@@ -2847,7 +2860,7 @@ fn replace_database_from_jsonl_snapshot(
                 db_path,
                 cli.lock_timeout,
                 &bootstrap_layer,
-                import_config.clone(),
+                import_config,
                 source,
                 jsonl_authority,
                 authority,
@@ -2858,7 +2871,7 @@ fn replace_database_from_jsonl_snapshot(
                 db_path,
                 cli.lock_timeout,
                 &bootstrap_layer,
-                import_config.clone(),
+                import_config,
                 source,
                 jsonl_authority,
             )
@@ -3105,7 +3118,7 @@ fn execute_import(
         }
         return Ok(());
     };
-    let source_content_hash = compute_jsonl_snapshot_content_hash(source)?;
+    let source_content_hash = compute_jsonl_snapshot_content_hash(source);
 
     // If the storage was just rebuilt from JSONL during the open sequence
     // (either the DB file did not exist or a recoverable anomaly triggered
@@ -4276,7 +4289,17 @@ fn execute_merge(
     let database_before = capture_sync_database_witness(storage)?;
 
     // 1. Load Base State (ancestor) from the exact retained generation.
-    let base = load_base_snapshot_from_source(base_source.as_ref())?;
+    let mut base = HashMap::new();
+    let mut base_sequences = HashMap::new();
+    if let Some(base_source) = base_source.as_ref() {
+        ensure_no_conflict_markers_snapshot(base_source)?;
+        for record in read_issue_records_from_jsonl_snapshot(base_source)? {
+            if let Some(sequence_number) = record.sequence_number {
+                base_sequences.insert(record.issue.id.clone(), sequence_number);
+            }
+            base.insert(record.issue.id.clone(), record.issue);
+        }
+    }
     debug!(base_count = base.len(), "Loaded base snapshot");
 
     // 2. Load Left State (local DB)
@@ -4297,6 +4320,11 @@ fn execute_merge(
         }
     }
 
+    let left_ids = left_issues
+        .iter()
+        .map(|issue| issue.id.clone())
+        .collect::<Vec<_>>();
+    let left_sequences = storage.issue_sequence_numbers_for_ids(&left_ids)?;
     let mut left = HashMap::new();
     for issue in left_issues {
         left.insert(issue.id.clone(), issue);
@@ -4312,6 +4340,7 @@ fn execute_merge(
 
     // 3. Load Right State (external JSONL)
     let mut right = HashMap::new();
+    let mut right_sequences = HashMap::new();
     if let Some(source) = source {
         // The JSONL parser yields a generic
         // generic "Invalid JSON at line 1" error when the JSONL still
@@ -4320,8 +4349,11 @@ fn execute_merge(
         // would be nonsense, so scan for markers first and surface the
         // helpful error before we try to parse.
         ensure_no_conflict_markers_snapshot(source)?;
-        for issue in read_issues_from_jsonl_snapshot(source)? {
-            right.insert(issue.id.clone(), issue);
+        for record in read_issue_records_from_jsonl_snapshot(source)? {
+            if let Some(sequence_number) = record.sequence_number {
+                right_sequences.insert(record.issue.id.clone(), sequence_number);
+            }
+            right.insert(record.issue.id.clone(), record.issue);
         }
     }
     debug!(right_count = right.len(), "Loaded external state (JSONL)");
@@ -4392,12 +4424,46 @@ fn execute_merge(
         .iter()
         .map(|(issue_id, _)| issue_id.as_str())
         .collect::<HashSet<_>>();
+    let merged_sequence_number = |issue: &crate::model::Issue| match strategy {
+        ConflictResolution::PreferExternal => right_sequences
+            .get(&issue.id)
+            .or_else(|| left_sequences.get(&issue.id))
+            .or_else(|| base_sequences.get(&issue.id))
+            .copied(),
+        ConflictResolution::PreferLocal => left_sequences
+            .get(&issue.id)
+            .or_else(|| right_sequences.get(&issue.id))
+            .or_else(|| base_sequences.get(&issue.id))
+            .copied(),
+        ConflictResolution::PreferNewer | ConflictResolution::Manual => {
+            if context.left.get(&issue.id) == Some(issue) {
+                left_sequences
+                    .get(&issue.id)
+                    .or_else(|| right_sequences.get(&issue.id))
+                    .or_else(|| base_sequences.get(&issue.id))
+                    .copied()
+            } else if context.right.get(&issue.id) == Some(issue) {
+                right_sequences
+                    .get(&issue.id)
+                    .or_else(|| left_sequences.get(&issue.id))
+                    .or_else(|| base_sequences.get(&issue.id))
+                    .copied()
+            } else {
+                base_sequences
+                    .get(&issue.id)
+                    .or_else(|| left_sequences.get(&issue.id))
+                    .or_else(|| right_sequences.get(&issue.id))
+                    .copied()
+            }
+        }
+    };
     let mut changed_kept = report
         .kept
         .iter()
         .filter(|issue| {
             context.left.get(&issue.id) != Some(*issue)
                 || note_target_ids.contains(issue.id.as_str())
+                || merged_sequence_number(issue) != left_sequences.get(&issue.id).copied()
         })
         .cloned()
         .collect::<Vec<_>>();
@@ -4405,6 +4471,12 @@ fn execute_merge(
     let changed_kept_ids = changed_kept
         .iter()
         .map(|issue| issue.id.clone())
+        .collect::<Vec<_>>();
+    let changed_kept_sequences = changed_kept
+        .iter()
+        .filter_map(|issue| {
+            merged_sequence_number(issue).map(|sequence_number| (issue.id.clone(), sequence_number))
+        })
         .collect::<Vec<_>>();
     let kept_issue_witnesses = crate::sync::sync_merge_kept_issue_witnesses(&changed_kept)?;
     let mut deleted_ids = report.deleted.clone();
@@ -4444,6 +4516,7 @@ fn execute_merge(
         kept_issue_witnesses,
         deleted_issue_ids: deleted_ids,
         note_witnesses,
+        sequence_numbers: changed_kept_sequences,
         database_before,
     };
     let pending_receipt = storage.apply_sync_merge_atomically(

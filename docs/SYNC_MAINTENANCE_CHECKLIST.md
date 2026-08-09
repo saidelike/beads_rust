@@ -31,20 +31,23 @@ Before merging any PR that touches sync code, verify all checks pass:
 # Structural check over both complete sync source boundaries. This fails on
 # missing/unreadable/non-UTF-8/symlinked/special source entries as well as direct
 # process authority, Git libraries, and delegation to the VCS adapter.
-cargo test --lib 'validation::tests::sync_safety_' -- --nocapture
+./scripts/with-build-limits.sh env CARGO_BUILD_JOBS=2 \
+  cargo test --lib 'validation::tests::sync_safety_' -- --nocapture
 
 # Runtime check: every sync mode gets a fake `git` first on PATH and a
 # byte-exact, zero-exclusion .git tree comparison around the invocation.
-cargo test --test e2e_sync_git_safety \
+./scripts/with-build-limits.sh env CARGO_BUILD_JOBS=2 \
+  cargo test --test e2e_sync_git_safety \
   e2e_every_sync_mode_has_zero_git_authority_and_zero_git_mutation
 
 # Parsed direct-runtime dependency check (normal/target declarations, aliases,
 # malformed manifests, and non-table forms fail closed)
-cargo test --lib sync_safety_no_direct_runtime_git_library_dependencies
+./scripts/with-build-limits.sh env CARGO_BUILD_JOBS=2 \
+  cargo test --lib sync_safety_no_direct_runtime_git_library_dependencies
 
 # Resolved transitive runtime closure (build/dev tooling is excluded)
-RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 \
-  rch --no-self-healing exec -- cargo tree -e normal --prefix none
+./scripts/with-build-limits.sh env CARGO_BUILD_JOBS=2 \
+  cargo tree -e normal --prefix none
 ```
 
 Fail closed if the runtime tree contains `git2-*`, `libgit2-*`, `gix-*`,
@@ -82,6 +85,8 @@ Verify the allowlist only includes:
 - `.beads/*.db-fsqlite-ns-gate`, `.beads/*.db-fsqlite-ns-use` (fsqlite multi-process
   namespace admission sidecars; the engine creates and updates these for every
   database path it opens, so sync observes them alongside the classic trio)
+- `.beads/.write.lock` plus exact `.beads/.br-db-write-<24 lowercase hex>.lock`
+  and `.beads/.br-jsonl-write-<24 lowercase hex>.lock` coordination authorities
 - `.beads/*.jsonl` (JSONL export)
 - `.beads/*.jsonl.tmp` (atomic write temp files)
 - `.beads/.manifest.json` (optional manifest)
@@ -99,20 +104,23 @@ Verify the allowlist only includes:
 
 ```bash
 # Run all tests (required)
-cargo test --release
+./scripts/with-build-limits.sh env CARGO_BUILD_JOBS=2 cargo test --release
 
 # Run sync-specific unit tests
-cargo test sync:: --release
+./scripts/with-build-limits.sh env CARGO_BUILD_JOBS=2 cargo test sync:: --release
 
 # Run sync safety e2e tests
-cargo test --test e2e_sync_git_safety
+./scripts/with-build-limits.sh env CARGO_BUILD_JOBS=2 \
+  cargo test --test e2e_sync_git_safety
 
 # Run the additive-reconcile suite (false-equal repair, event preservation,
 # dry-run zero-mutation, plan/apply witness rollback)
-cargo test --test e2e_sync_reconcile --release
+./scripts/with-build-limits.sh env CARGO_BUILD_JOBS=2 \
+  cargo test --test e2e_sync_reconcile --release
 
 # Run with verbose output for debugging
-cargo test --test e2e_sync_git_safety -- --nocapture
+./scripts/with-build-limits.sh env CARGO_BUILD_JOBS=2 \
+  cargo test --test e2e_sync_git_safety -- --nocapture
 ```
 
 **Expected results**:
@@ -132,7 +140,8 @@ cargo test --test e2e_sync_git_safety -- --nocapture
 
 1. Enable verbose logging:
    ```bash
-   RUST_LOG=beads_rust=debug cargo test --release \
+   ./scripts/with-build-limits.sh env CARGO_BUILD_JOBS=2 \
+     RUST_LOG=beads_rust=debug cargo test --release \
      --test e2e_sync_git_safety \
      --test e2e_sync_status_health \
      --test e2e_vcs_status \
@@ -162,8 +171,8 @@ cargo test --test e2e_sync_git_safety -- --nocapture
 | Document | When to update |
 |----------|----------------|
 | `docs/SYNC_SAFETY.md` | User-facing safety model changes |
-| `.beads/SYNC_SAFETY_INVARIANTS.md` | Technical invariant additions/modifications |
-| `.beads/SYNC_CLI_FLAG_SEMANTICS.md` | New flags or flag behavior changes |
+| `docs/SYNC_SAFETY_INVARIANTS.md` | Technical invariant additions/modifications |
+| `docs/SYNC_CLI_FLAG_SEMANTICS.md` | New flags or flag behavior changes |
 | `docs/E2E_SYNC_TESTS.md` | New test files or test patterns |
 
 **Checklist for docs**:
@@ -190,14 +199,16 @@ Run this final check before approving:
 
 ```bash
 # 1. Verify no process/VCS authority in either sync source boundary
-cargo test --lib 'validation::tests::sync_safety_' -- --nocapture
+./scripts/with-build-limits.sh env CARGO_BUILD_JOBS=2 \
+  cargo test --lib 'validation::tests::sync_safety_' -- --nocapture
 
 # 2. Verify every sync mode under PATH sentinel + exact .git snapshot
-cargo test --test e2e_sync_git_safety \
+./scripts/with-build-limits.sh env CARGO_BUILD_JOBS=2 \
+  cargo test --test e2e_sync_git_safety \
   e2e_every_sync_mode_has_zero_git_authority_and_zero_git_mutation
 
 # 3. Run full test suite
-cargo test --release
+./scripts/with-build-limits.sh env CARGO_BUILD_JOBS=2 cargo test --release
 
 # 4. Check for any test failures
 echo $?  # Should be 0
@@ -236,8 +247,8 @@ Contact the maintainer team before proceeding with any of these cases.
 
 - [SYNC_SAFETY.md](SYNC_SAFETY.md) - User-facing safety model
 - [E2E_SYNC_TESTS.md](E2E_SYNC_TESTS.md) - Test execution guide
-- [.beads/SYNC_SAFETY_INVARIANTS.md](../.beads/SYNC_SAFETY_INVARIANTS.md) - Technical invariants
-- [.beads/SYNC_THREAT_MODEL.md](../.beads/SYNC_THREAT_MODEL.md) - Threat analysis
+- [SYNC_SAFETY_INVARIANTS.md](SYNC_SAFETY_INVARIANTS.md) - Technical invariants
+- [SYNC_THREAT_MODEL.md](SYNC_THREAT_MODEL.md) - Threat analysis
 
 ---
 

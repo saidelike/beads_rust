@@ -58,6 +58,10 @@ fn run_installer(temp_dir: &TempDir, args: &[&str], env_vars: HashMap<&str, &str
     cmd.env("HOME", temp_dir.path());
     cmd.env("DEST", &dest_dir);
     cmd.env("NO_GUM", "1"); // Disable fancy output for test parsing
+    cmd.env(
+        "BR_INSTALL_LOCK_FILE",
+        temp_dir.path().join("br-install.lock"),
+    );
     cmd.current_dir(temp_dir.path());
 
     // Clear potentially interfering variables
@@ -92,6 +96,10 @@ fn run_installer_function(temp_dir: &TempDir, _function_name: &str, function_cal
         .env("HOME", temp_dir.path())
         .env("NO_GUM", "1")
         .env("QUIET", "1")
+        .env(
+            "BR_INSTALL_LOCK_FILE",
+            temp_dir.path().join("br-install.lock"),
+        )
         .current_dir(temp_dir.path())
         .output()
         .expect("Failed to run installer function")
@@ -539,7 +547,7 @@ fn e2e_installer_lock_prevents_concurrent() {
     let temp = TempDir::new().expect("temp dir");
 
     // Create a stale lock directory
-    let lock_dir = PathBuf::from("/tmp/br-install.lock.d");
+    let lock_dir = temp.path().join("br-install.lock.d");
 
     // Clean up any existing lock first
     let _ = fs::remove_dir_all(&lock_dir);

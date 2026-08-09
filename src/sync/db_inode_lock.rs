@@ -71,7 +71,7 @@ use std::fs::{File, TryLockError};
 /// - No real database file can reach this offset (SQLite's maximum database
 ///   size is far smaller), so on Windows the mandatory byte lock can never
 ///   intersect actual data I/O.
-pub(crate) const DATABASE_INODE_LOCK_OFFSET: i64 = i64::MAX - 1;
+pub const DATABASE_INODE_LOCK_OFFSET: i64 = i64::MAX - 1;
 
 /// Try to acquire the exclusive database-inode authority lock, non-blocking.
 ///
@@ -90,7 +90,7 @@ pub(crate) const DATABASE_INODE_LOCK_OFFSET: i64 = i64::MAX - 1;
     target_os = "ios"
 ))]
 #[allow(unsafe_code)]
-pub(crate) fn try_lock_database_inode(file: &File) -> Result<(), TryLockError> {
+pub fn try_lock_database_inode(file: &File) -> Result<(), TryLockError> {
     use std::os::fd::AsRawFd;
 
     let lock = libc::flock {
@@ -132,7 +132,7 @@ pub(crate) fn try_lock_database_inode(file: &File) -> Result<(), TryLockError> {
     ))
 ))]
 #[allow(clippy::incompatible_msrv)]
-pub(crate) fn try_lock_database_inode(file: &File) -> Result<(), TryLockError> {
+pub fn try_lock_database_inode(file: &File) -> Result<(), TryLockError> {
     file.try_lock()
 }
 
@@ -140,7 +140,7 @@ pub(crate) fn try_lock_database_inode(file: &File) -> Result<(), TryLockError> {
 /// [`DATABASE_INODE_LOCK_OFFSET`].
 #[cfg(windows)]
 #[allow(unsafe_code, non_snake_case, clippy::items_after_statements)]
-pub(crate) fn try_lock_database_inode(file: &File) -> Result<(), TryLockError> {
+pub fn try_lock_database_inode(file: &File) -> Result<(), TryLockError> {
     use std::os::windows::io::AsRawHandle;
 
     // Minimal local declarations mirroring `windows-sys`; kept private so the

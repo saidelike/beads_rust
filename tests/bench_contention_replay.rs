@@ -19,6 +19,7 @@ use beads_rust::util::hex_encode;
 use beads_rust::write_combining::{
     BatchLimits, CombinedOutputMode, CompatibleMutation, MutationEnvelope, plan_batch,
 };
+use common::cli::isolated_temp_root;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -212,7 +213,7 @@ fn build_plan(profile: &ContentionProfile) -> Vec<PlannedCommand> {
 }
 
 fn run_contention_lab(profile: ContentionProfile) -> io::Result<ContentionRun> {
-    let temp_dir = TempDir::new()?;
+    let temp_dir = TempDir::new_in(isolated_temp_root())?;
     let root = temp_dir.path().to_path_buf();
     initialize_workspace(&root)?;
 
@@ -371,7 +372,7 @@ fn replay_contention_trace(trace: &ContentionTrace) -> io::Result<ReplayReport> 
         });
     }
 
-    let temp_dir = TempDir::new()?;
+    let temp_dir = TempDir::new_in(isolated_temp_root())?;
     let root = temp_dir.path().to_path_buf();
     initialize_workspace(&root)?;
 

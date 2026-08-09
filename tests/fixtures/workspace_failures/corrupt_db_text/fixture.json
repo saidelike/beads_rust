@@ -6,11 +6,11 @@
   "expected_command_outcomes": [
     {
       "surface": "startup/open",
-      "outcome": "success_with_auto_recovery"
+      "outcome": "fails_database_authority"
     },
     {
       "surface": "create",
-      "outcome": "success_with_auto_recovery"
+      "outcome": "fails_database_authority"
     },
     {
       "surface": "doctor",
@@ -18,11 +18,11 @@
     },
     {
       "surface": "doctor --repair",
-      "outcome": "repair_applied"
+      "outcome": "fails_doctor_authority"
     },
     {
       "surface": "sync --status",
-      "outcome": "status_in_sync"
+      "outcome": "fails_database_authority"
     },
     {
       "surface": "list --no-db",
@@ -32,6 +32,6 @@
   "source_hint": "Derived from the malformed-db repair cases in tests/e2e_workspace_commands.rs and tests/e2e_global_flags.rs.",
   "notes": [
     "Represents the simplest non-SQLite database corruption case.",
-    "Intended to drive rebuild-or-bypass behavior rather than low-level SQLite recovery."
+    "Commands preserve the unreadable database family and fail closed because they cannot prove that no sync merge is pending; operators must first restore an inspectable database family."
   ]
 }

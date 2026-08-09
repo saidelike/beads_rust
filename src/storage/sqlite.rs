@@ -8,15 +8,18 @@ use crate::model::{
 use crate::storage::events::get_events;
 use crate::storage::schema::CURRENT_SCHEMA_VERSION;
 use crate::storage::schema::{
-    apply_runtime_compatible_schema, apply_schema, execute_batch, runtime_schema_compatible,
-    table_exists,
+    apply_runtime_compatible_schema, apply_schema, execute_batch,
+    restore_runtime_schema_in_transaction, runtime_schema_compatible, table_exists,
 };
 use crate::sync::{
     METADATA_JSONL_CONTENT_HASH, METADATA_JSONL_MTIME, METADATA_JSONL_SIZE,
     METADATA_LAST_EXPORT_TIME, METADATA_LAST_IMPORT_TIME, METADATA_SYNC_MERGE_PENDING,
     METADATA_SYNC_MERGE_PENDING_LEGACY, SyncMergeIntent, SyncMergePendingReceipt,
 };
-use crate::util::id::{normalize_prefix, parse_id};
+use crate::util::id::{
+    IdConfig, IdGenerationInput, IdGenerationMode, IdGenerator, IssueSequenceNumber, child_id,
+    normalize_prefix, parse_id,
+};
 use crate::validation::{CommentValidator, ISSUE_LABEL_MAX_COUNT, IssueValidator, LabelValidator};
 use chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime, TimeZone, Utc};
 use fsqlite::Connection;
@@ -81,6 +84,22 @@ pub(crate) struct BulkDependencyInsert {
     pub(crate) issue_id: String,
     pub(crate) depends_on_id: String,
     pub(crate) dep_type: String,
+}
+
+/// Whether templated ID generation consumes the repository sequence counter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IssueSequenceAllocation {
+    /// Consume and permanently advance the counter.
+    Allocate,
+    /// Read the next value without advancing it, for dry-run output.
+    Preview,
+}
+
+/// ID plus optional sequence metadata produced by one generation operation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GeneratedIssueId {
+    pub id: String,
+    pub sequence_number: Option<IssueSequenceNumber>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1197,7 +1216,7 @@ const KNOWN_METADATA_DEFAULTS: [(&str, &str); 7] = [
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum PendingSyncMergeInspection {
     Absent,
-    Valid(SyncMergePendingReceipt),
+    Valid(Box<SyncMergePendingReceipt>),
     Legacy {
         metadata_key: String,
         row_count: usize,
@@ -1236,6 +1255,8 @@ impl PendingSyncMergeInspection {
 /// `NULL`, rather than going through `get_metadata()`. That prevents a
 /// duplicate, null, empty, legacy, or malformed receipt from being mistaken
 /// for the safe `Absent` state.
+// Keep all fail-closed receipt classifications in one auditable decision tree.
+#[allow(clippy::too_many_lines)]
 pub(crate) fn classify_pending_sync_merge_rows(
     current_rows: &[Option<String>],
     legacy_rows: &[Option<String>],
@@ -1345,7 +1366,7 @@ pub(crate) fn classify_pending_sync_merge_rows(
                     .to_string(),
         };
     }
-    PendingSyncMergeInspection::Valid(receipt)
+    PendingSyncMergeInspection::Valid(Box::new(receipt))
 }
 
 /// SQLite-based storage backend.
@@ -1388,6 +1409,9 @@ pub struct SqliteStorage {
     /// attempt-scoped gates and transition-required fields; enforcement occurs
     /// inside the same write transaction as the status change (GitHub #388).
     workflow_transition_policy: crate::close_policy::Workflow,
+    /// Effective issue-type behavior loaded from project policy. Direct
+    /// storage users retain the built-in Epic registry.
+    issue_type_registry: crate::close_policy::TypeCapabilityRegistry,
     /// Advisory capacity evidence produced by the most recently committed
     /// mutation. Cleared at the start of every mutation and consumed by the
     /// command layer immediately after success, so warnings cannot leak into
@@ -2044,15 +2068,29 @@ impl SqliteStorage {
     fn apply_blocked_cache_refresh_plan(
         conn: &Connection,
         plan: &BlockedCacheRefreshPlan,
+        registry: &crate::close_policy::TypeCapabilityRegistry,
     ) -> Result<usize> {
         match plan {
-            BlockedCacheRefreshPlan::Full => Self::rebuild_blocked_cache_impl(conn),
+            BlockedCacheRefreshPlan::Full => Self::rebuild_blocked_cache_impl(conn, registry),
             BlockedCacheRefreshPlan::Incremental(ids) => {
-                Self::incremental_blocked_cache_update(conn, ids)
+                Self::incremental_blocked_cache_update(conn, ids, registry)
             }
             // Deferred plan is never applied eagerly; the stale marker already
             // set inside the write transaction signals reads to compute in-memory.
             BlockedCacheRefreshPlan::Deferred => Ok(0),
+        }
+    }
+
+    fn blocked_cache_state_after_refresh(
+        registry: &crate::close_policy::TypeCapabilityRegistry,
+    ) -> &'static str {
+        if registry.is_builtin_only() {
+            METADATA_EMPTY_VALUE
+        } else {
+            // The persisted cache has no policy fingerprint. Keep it marked
+            // stale whenever custom capability semantics shaped the projection
+            // so removing that policy cannot make builtin reads trust it.
+            BLOCKED_CACHE_STATE_STALE
         }
     }
 
@@ -2189,8 +2227,13 @@ impl SqliteStorage {
         // surface false FK violations on blocked_issues_cache inserts (#215).
         self.conn.execute("PRAGMA foreign_keys = OFF")?;
         let result = self.with_connection_write_transaction(|conn| {
-            let refreshed = Self::apply_blocked_cache_refresh_plan(conn, plan)?;
-            Self::upsert_metadata_key_in_tx(conn, BLOCKED_CACHE_STATE_KEY, METADATA_EMPTY_VALUE)?;
+            let refreshed =
+                Self::apply_blocked_cache_refresh_plan(conn, plan, &self.issue_type_registry)?;
+            Self::upsert_metadata_key_in_tx(
+                conn,
+                BLOCKED_CACHE_STATE_KEY,
+                Self::blocked_cache_state_after_refresh(&self.issue_type_registry),
+            )?;
             tracing::debug!(operation = op, refreshed, "Refreshed blocked issues cache");
             Ok(())
         });
@@ -2253,8 +2296,12 @@ impl SqliteStorage {
                 return Ok(false);
             }
 
-            let refreshed = Self::rebuild_blocked_cache_impl(conn)?;
-            Self::upsert_metadata_key_in_tx(conn, BLOCKED_CACHE_STATE_KEY, METADATA_EMPTY_VALUE)?;
+            let refreshed = Self::rebuild_blocked_cache_impl(conn, &self.issue_type_registry)?;
+            Self::upsert_metadata_key_in_tx(
+                conn,
+                BLOCKED_CACHE_STATE_KEY,
+                Self::blocked_cache_state_after_refresh(&self.issue_type_registry),
+            )?;
             tracing::debug!(refreshed, "Rebuilt stale blocked issues cache on demand");
             Ok(true)
         });
@@ -2318,6 +2365,7 @@ impl SqliteStorage {
             pending_event_attribution: None,
             workflow_capacity_policy: crate::close_policy::CapacityPolicy::default(),
             workflow_transition_policy: crate::close_policy::Workflow::default(),
+            issue_type_registry: crate::close_policy::TypeCapabilityRegistry::default(),
             last_capacity_warnings: Vec::new(),
         })
     }
@@ -2359,6 +2407,7 @@ impl SqliteStorage {
             pending_event_attribution: None,
             workflow_capacity_policy: crate::close_policy::CapacityPolicy::default(),
             workflow_transition_policy: crate::close_policy::Workflow::default(),
+            issue_type_registry: crate::close_policy::TypeCapabilityRegistry::default(),
             last_capacity_warnings: Vec::new(),
         }))
     }
@@ -2398,6 +2447,7 @@ impl SqliteStorage {
             pending_event_attribution: None,
             workflow_capacity_policy: crate::close_policy::CapacityPolicy::default(),
             workflow_transition_policy: crate::close_policy::Workflow::default(),
+            issue_type_registry: crate::close_policy::TypeCapabilityRegistry::default(),
             last_capacity_warnings: Vec::new(),
         }))
     }
@@ -2451,6 +2501,7 @@ impl SqliteStorage {
             pending_event_attribution: None,
             workflow_capacity_policy: crate::close_policy::CapacityPolicy::default(),
             workflow_transition_policy: crate::close_policy::Workflow::default(),
+            issue_type_registry: crate::close_policy::TypeCapabilityRegistry::default(),
             last_capacity_warnings: Vec::new(),
         })
     }
@@ -2491,10 +2542,9 @@ impl SqliteStorage {
             ",
         )?;
         // Recreate with full schema (config/metadata already exist, IF NOT EXISTS is safe).
-        // Use apply_runtime_compatible_schema rather than apply_schema because we are
-        // mid-session: the connection is already open with correct pragmas and we only
-        // need to restore the DDL without re-running heavier first-open migrations.
-        apply_runtime_compatible_schema(&self.conn)?;
+        // This reset already runs inside BEGIN IMMEDIATE, so restore canonical DDL without
+        // invoking migration steps that may open their own transactions.
+        restore_runtime_schema_in_transaction(&self.conn)?;
         Ok(())
     }
 
@@ -2796,7 +2846,7 @@ impl SqliteStorage {
                             Ok(_) => Err(original_error),
                             Err(rollback_error) => Err(Self::rollback_failure_error(
                                 original_error,
-                                rollback_error,
+                                &rollback_error,
                                 "read-transaction COMMIT error",
                             )),
                         }
@@ -2807,7 +2857,7 @@ impl SqliteStorage {
                 Ok(_) => Err(original_error),
                 Err(rollback_error) => Err(Self::rollback_failure_error(
                     original_error,
-                    rollback_error,
+                    &rollback_error,
                     "read-transaction body error",
                 )),
             },
@@ -2816,7 +2866,7 @@ impl SqliteStorage {
 
     fn rollback_failure_error(
         original_error: BeadsError,
-        rollback_error: FrankenError,
+        rollback_error: &FrankenError,
         cause: &str,
     ) -> BeadsError {
         BeadsError::WithContext {
@@ -2835,7 +2885,7 @@ impl SqliteStorage {
         match rollback_result {
             Ok(_) => original_error,
             Err(rollback_error) => {
-                Self::rollback_failure_error(original_error, rollback_error, cause)
+                Self::rollback_failure_error(original_error, &rollback_error, cause)
             }
         }
     }
@@ -4723,6 +4773,20 @@ impl SqliteStorage {
         self.workflow_transition_policy = policy;
     }
 
+    /// Install the already-validated effective issue-type registry.
+    pub fn set_issue_type_registry(
+        &mut self,
+        registry: crate::close_policy::TypeCapabilityRegistry,
+    ) {
+        self.issue_type_registry = registry;
+    }
+
+    /// Effective issue-type registry used by storage and command behavior.
+    #[must_use]
+    pub fn issue_type_registry(&self) -> &crate::close_policy::TypeCapabilityRegistry {
+        &self.issue_type_registry
+    }
+
     /// Snapshot the installed full workflow policy across JSONL recovery.
     #[must_use]
     pub(crate) fn workflow_policy(&self) -> crate::close_policy::Workflow {
@@ -6093,6 +6157,21 @@ impl SqliteStorage {
     /// Returns an error if the issue cannot be inserted (e.g. ID collision).
     #[allow(clippy::too_many_lines)]
     pub fn create_issue(&mut self, issue: &Issue, actor: &str) -> Result<()> {
+        self.create_issue_with_sequence(issue, actor, None)
+    }
+
+    /// Create a new issue and optionally bind a sequence number atomically.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the issue or sequence cannot be inserted.
+    #[allow(clippy::too_many_lines)]
+    pub fn create_issue_with_sequence(
+        &mut self,
+        issue: &Issue,
+        actor: &str,
+        sequence_number: Option<IssueSequenceNumber>,
+    ) -> Result<()> {
         IssueValidator::validate(issue).map_err(BeadsError::from_validation_errors)?;
         validate_issue_comments_for_create(issue)?;
         let capacity_policy = self.workflow_capacity_policy.clone();
@@ -6214,6 +6293,10 @@ impl SqliteStorage {
             // initial status; record the admitting attribution.
             Self::record_capacity_occupancy_in_tx(conn, &issue.id, &ctx.actor, &ctx.attribution)?;
 
+            if let Some(sequence_number) = sequence_number {
+                Self::record_issue_sequence_number_on_conn(conn, &issue.id, sequence_number)?;
+            }
+
             // Update child counter if this is a hierarchical ID
             if let Ok(parsed) = parse_id(&issue.id)
                 && !parsed.is_root()
@@ -6249,7 +6332,7 @@ impl SqliteStorage {
                     });
                 }
 
-                if !seen_deps.insert(dep.depends_on_id.as_str()) {
+                if !seen_deps.insert((dep.depends_on_id.as_str(), dep.dep_type.as_str())) {
                     continue;
                 }
                 Self::ensure_dependency_target_exists_in_tx(conn, &dep.depends_on_id)?;
@@ -9144,6 +9227,7 @@ impl SqliteStorage {
         sort: ReadySortPolicy,
     ) -> Result<Vec<Issue>> {
         self.get_ready_issues_with_projection(filters, sort, ReadyIssueProjection::Full)
+            .map(|issues| self.filter_ready_work_issues(issues))
     }
 
     /// Get ready issues optimized for `ready` command rendering.
@@ -9161,6 +9245,7 @@ impl SqliteStorage {
         sort: ReadySortPolicy,
     ) -> Result<Vec<Issue>> {
         self.get_ready_issues_with_projection(filters, sort, ReadyIssueProjection::Command)
+            .map(|issues| self.filter_ready_work_issues(issues))
     }
 
     /// Get ready issues optimized for compact text command rendering.
@@ -9179,6 +9264,25 @@ impl SqliteStorage {
         sort: ReadySortPolicy,
     ) -> Result<Vec<Issue>> {
         self.get_ready_issues_with_projection(filters, sort, ReadyIssueProjection::Summary)
+            .map(|issues| self.filter_ready_work_issues(issues))
+    }
+
+    fn filter_ready_work_issues(&self, mut issues: Vec<Issue>) -> Vec<Issue> {
+        issues.retain(|issue| {
+            self.issue_type_registry
+                .capabilities_for_name(issue.issue_type.as_str())
+                .ready_work
+        });
+        issues
+    }
+
+    /// Whether an issue type participates in ready-work selection under the
+    /// active project policy.
+    #[must_use]
+    pub fn type_participates_in_ready_work(&self, issue_type: &str) -> bool {
+        self.issue_type_registry
+            .capabilities_for_name(issue_type)
+            .ready_work
     }
 
     fn get_ready_issues_with_projection(
@@ -9211,8 +9315,11 @@ impl SqliteStorage {
 
         // Read-only path: if the cache is stale, compute blocked IDs in memory
         // instead of persisting (issue #216 — read ops must not write).
-        if readiness.blocked_cache_stale {
-            let blocked_ids = match Self::compute_blocked_issues_map_impl(&self.conn) {
+        if readiness.blocked_cache_stale || !self.issue_type_registry.is_builtin_only() {
+            let blocked_ids = match Self::compute_blocked_issues_map_impl(
+                &self.conn,
+                &self.issue_type_registry,
+            ) {
                 Ok(map) => map.into_keys().collect(),
                 Err(error) => self.recover_blocked_ids("ready_issues_stale", &error)?,
             };
@@ -9608,6 +9715,7 @@ impl SqliteStorage {
             filters, sort, false, false, projection,
         )?;
         issues.retain(|issue| !blocked_ids.contains(issue.id.as_str()));
+        issues = self.filter_ready_work_issues(issues);
         if let Some(limit) = filters.limit
             && limit > 0
             && issues.len() > limit
@@ -9635,7 +9743,7 @@ impl SqliteStorage {
                 "Blocked cache unavailable; computing blocker graph directly"
             );
         }
-        Self::compute_blocked_issues_map_impl(&self.conn)
+        Self::compute_blocked_issues_map_impl(&self.conn, &self.issue_type_registry)
     }
 
     fn recover_blocked_ids(
@@ -9657,8 +9765,11 @@ impl SqliteStorage {
     pub fn get_blocked_ids(&self) -> Result<HashSet<String>> {
         // Read-only path: if the cache is stale, compute in memory instead of
         // persisting (issue #216 — read ops must not write).
-        if self.blocked_cache_marked_stale()? {
-            return match Self::compute_blocked_issues_map_impl(&self.conn) {
+        if self.blocked_cache_marked_stale()? || !self.issue_type_registry.is_builtin_only() {
+            return match Self::compute_blocked_issues_map_impl(
+                &self.conn,
+                &self.issue_type_registry,
+            ) {
                 Ok(map) => Ok(map.into_keys().collect()),
                 Err(error) => self.recover_blocked_ids("get_blocked_ids_stale", &error),
             };
@@ -9790,8 +9901,11 @@ impl SqliteStorage {
     pub fn is_blocked(&self, issue_id: &str) -> Result<bool> {
         // Read-only path: if the cache is stale, compute in memory instead of
         // persisting (issue #216 — read ops must not write).
-        if self.blocked_cache_marked_stale()? {
-            let blocked_ids = match Self::compute_blocked_issues_map_impl(&self.conn) {
+        if self.blocked_cache_marked_stale()? || !self.issue_type_registry.is_builtin_only() {
+            let blocked_ids = match Self::compute_blocked_issues_map_impl(
+                &self.conn,
+                &self.issue_type_registry,
+            ) {
                 Ok(map) => map.into_keys().collect::<HashSet<_>>(),
                 Err(error) => self.recover_blocked_ids("is_blocked_stale", &error)?,
             };
@@ -9878,10 +9992,19 @@ impl SqliteStorage {
     ///
     /// Returns an error if the database query fails.
     pub fn get_close_blockers(&self, issue_id: &str) -> Result<Vec<String>> {
+        let may_close_with_open_children = self.get_issue(issue_id)?.is_some_and(|issue| {
+            self.issue_type_registry
+                .capabilities_for_name(issue.issue_type.as_str())
+                .may_close_with_open_children
+        });
         let close_blocker_refs: Vec<String> = self
             .get_blocker_refs(issue_id)?
             .into_iter()
-            .filter(|blocker| !blocker.ends_with(PARENT_BLOCKED_SUFFIX))
+            .filter(|blocker| {
+                !blocker.ends_with(PARENT_BLOCKED_SUFFIX)
+                    && (!may_close_with_open_children
+                        || !blocker.ends_with(CHILD_OPEN_BLOCKER_SUFFIX))
+            })
             .collect();
         Ok(Self::blocker_refs_to_issue_ids(&close_blocker_refs))
     }
@@ -9894,8 +10017,11 @@ impl SqliteStorage {
     fn get_blocker_refs(&self, issue_id: &str) -> Result<Vec<String>> {
         // Read-only path: if the cache is stale, compute in memory instead of
         // persisting (issue #216 — read ops must not write).
-        if self.blocked_cache_marked_stale()? {
-            let blocked_issues_map = match Self::compute_blocked_issues_map_impl(&self.conn) {
+        if self.blocked_cache_marked_stale()? || !self.issue_type_registry.is_builtin_only() {
+            let blocked_issues_map = match Self::compute_blocked_issues_map_impl(
+                &self.conn,
+                &self.issue_type_registry,
+            ) {
                 Ok(map) => map,
                 Err(error) => self.recover_blocked_issues_map("get_blockers_stale", &error)?,
             };
@@ -9951,11 +10077,12 @@ impl SqliteStorage {
         // Disable FK enforcement before the transaction (#215).
         self.conn.execute("PRAGMA foreign_keys = OFF")?;
         let result = self.with_write_transaction(|storage| {
-            let rebuilt = Self::rebuild_blocked_cache_impl(&storage.conn)?;
+            let rebuilt =
+                Self::rebuild_blocked_cache_impl(&storage.conn, &storage.issue_type_registry)?;
             Self::upsert_metadata_key_in_tx(
                 &storage.conn,
                 BLOCKED_CACHE_STATE_KEY,
-                METADATA_EMPTY_VALUE,
+                Self::blocked_cache_state_after_refresh(&storage.issue_type_registry),
             )?;
             Ok(rebuilt)
         });
@@ -9971,8 +10098,12 @@ impl SqliteStorage {
     ///
     /// Returns an error if the rebuild fails.
     pub(crate) fn rebuild_blocked_cache_in_tx(&self) -> Result<usize> {
-        let rebuilt = Self::rebuild_blocked_cache_impl(&self.conn)?;
-        Self::upsert_metadata_key_in_tx(&self.conn, BLOCKED_CACHE_STATE_KEY, METADATA_EMPTY_VALUE)?;
+        let rebuilt = Self::rebuild_blocked_cache_impl(&self.conn, &self.issue_type_registry)?;
+        Self::upsert_metadata_key_in_tx(
+            &self.conn,
+            BLOCKED_CACHE_STATE_KEY,
+            Self::blocked_cache_state_after_refresh(&self.issue_type_registry),
+        )?;
         Ok(rebuilt)
     }
 
@@ -10073,7 +10204,10 @@ impl SqliteStorage {
         Ok(count)
     }
 
-    fn compute_blocked_issues_map_impl(conn: &Connection) -> Result<HashMap<String, Vec<String>>> {
+    fn compute_blocked_issues_map_impl(
+        conn: &Connection,
+        registry: &crate::close_policy::TypeCapabilityRegistry,
+    ) -> Result<HashMap<String, Vec<String>>> {
         let mut blocked_issues_map = Self::load_direct_blockers_impl(conn)?;
         let children_by_parent = Self::load_local_parent_child_edges_impl(conn)?;
 
@@ -10084,7 +10218,7 @@ impl SqliteStorage {
         // 2. Add blockers for parents with open children.
         // We do this AFTER propagation so that a parent blocked only by its children
         // does not transitively block those same children (avoiding logic cycle).
-        let child_blockers = Self::load_local_open_child_blockers_impl(conn)?;
+        let child_blockers = Self::load_local_open_child_blockers_impl(conn, registry)?;
         for (parent_id, mut blockers) in child_blockers {
             blocked_issues_map
                 .entry(parent_id)
@@ -10104,14 +10238,16 @@ impl SqliteStorage {
     pub(crate) fn blocked_cache_projection_health(
         conn: &Connection,
     ) -> BlockedCacheProjectionHealth {
-        let direct_map = Self::compute_blocked_issues_map_impl(conn).ok();
+        let registry = crate::close_policy::TypeCapabilityRegistry::default();
+        let direct_map = Self::compute_blocked_issues_map_impl(conn, &registry).ok();
         let cached_map = Self::load_blocked_cache_projection_map(conn).ok();
         Self::compare_blocked_cache_projection(cached_map.as_ref(), direct_map.as_ref())
     }
 
     pub(crate) fn ready_projection_health(conn: &Connection) -> ReadyProjectionHealth {
         let cached_ready_ids = Self::query_ready_projection_ids(conn, None, true).ok();
-        let direct_blocked_ids = Self::compute_blocked_issues_map_impl(conn)
+        let registry = crate::close_policy::TypeCapabilityRegistry::default();
+        let direct_blocked_ids = Self::compute_blocked_issues_map_impl(conn, &registry)
             .ok()
             .map(|map| map.into_keys().collect::<HashSet<_>>());
         let direct_ready_ids = direct_blocked_ids.as_ref().and_then(|blocked_ids| {
@@ -10267,8 +10403,11 @@ impl SqliteStorage {
         Ok(blocked_issues)
     }
 
-    fn rebuild_blocked_cache_impl(conn: &Connection) -> Result<usize> {
-        let blocked_issues_map = Self::compute_blocked_issues_map_impl(conn)?;
+    fn rebuild_blocked_cache_impl(
+        conn: &Connection,
+        registry: &crate::close_policy::TypeCapabilityRegistry,
+    ) -> Result<usize> {
+        let blocked_issues_map = Self::compute_blocked_issues_map_impl(conn, registry)?;
 
         // Clear the cache table before repopulating with fresh entries.
         Self::reset_blocked_cache_table(conn)?;
@@ -10334,6 +10473,7 @@ impl SqliteStorage {
     fn incremental_blocked_cache_update(
         conn: &Connection,
         seed_ids: &HashSet<String>,
+        registry: &crate::close_policy::TypeCapabilityRegistry,
     ) -> Result<usize> {
         let children_by_parent = Self::load_local_parent_child_edges_impl(conn)?;
         let parents_by_child = Self::build_parents_by_child(&children_by_parent);
@@ -10346,7 +10486,8 @@ impl SqliteStorage {
         // blocker graph inside the active write transaction.
         let mut blocked_issues_map = Self::load_direct_blockers_for_ids_impl(conn, &affected)?;
         Self::propagate_blocked_parents(&mut blocked_issues_map, &affected_children_by_parent);
-        let child_blockers = Self::load_local_open_child_blockers_for_ids_impl(conn, &affected)?;
+        let child_blockers =
+            Self::load_local_open_child_blockers_for_ids_impl(conn, &affected, registry)?;
         for (parent_id, mut blockers) in child_blockers {
             blocked_issues_map
                 .entry(parent_id)
@@ -10613,12 +10754,11 @@ impl SqliteStorage {
 
     fn load_local_open_child_blockers_impl(
         conn: &Connection,
+        registry: &crate::close_policy::TypeCapabilityRegistry,
     ) -> Result<HashMap<String, Vec<String>>> {
-        // Parents are treated as "blocked by open children" ONLY when the
-        // parent is an epic.  For epics that is the natural semantics: the
-        // epic aggregates its children and cannot itself be closed (or
-        // meaningfully worked on) while any child is still open.  For plain
-        // task/feature/bug/etc. parents in a parent-child chain, the
+        // Parents are treated as "blocked by open children" only when their
+        // effective type capability enables that rollup. Epic enables it by
+        // default; ordinary task/feature/bug/etc. parents do not. The
         // tests (`parent_child_transitive_blocking`,
         // `deep_parent_child_chain_blocking`,
         // `deep_chain_beyond_50_levels_blocks_all_descendants`) and the
@@ -10626,8 +10766,8 @@ impl SqliteStorage {
         // children inherit a parent's *blocked* state via
         // `propagate_blocked_parents`, but an open, unblocked non-epic
         // parent does not itself become blocked just because it has open
-        // children.  Restricting this rule to `p.issue_type = 'epic'`
-        // preserves the epic-rollup behaviour while avoiding the
+        // children. Capability-gating preserves Epic rollup behavior while
+        // allowing registered aggregate types to opt in or out and avoiding the
         // every-parent-with-open-kids false-blocked that was masking
         // genuine unblock transitions along a parent-child chain.
         //
@@ -10638,12 +10778,11 @@ impl SqliteStorage {
         // INSERT into `blocked_issues_cache` (which *does* have a FK on
         // `issue_id`) fails with "FOREIGN KEY constraint failed" (#215).
         let rows = conn.query(&format!(
-            "SELECT DISTINCT d.depends_on_id as parent_id, d.issue_id || '{CHILD_OPEN_BLOCKER_SUFFIX}' as blocker
+            "SELECT DISTINCT d.depends_on_id as parent_id, d.issue_id || '{CHILD_OPEN_BLOCKER_SUFFIX}' as blocker, p.issue_type
              FROM dependencies d
              JOIN issues i ON d.issue_id = i.id
              JOIN issues p ON d.depends_on_id = p.id
              WHERE d.type = 'parent-child'
-               AND p.issue_type = 'epic'
                AND i.status NOT IN ('closed', 'tombstone')
                AND (i.is_template = 0 OR i.is_template IS NULL)
                AND d.depends_on_id NOT LIKE 'external:%'
@@ -10657,6 +10796,13 @@ impl SqliteStorage {
             let Some(blocker) = row.get(1).and_then(SqliteValue::as_text) else {
                 continue;
             };
+            let parent_type = row.get(2).and_then(SqliteValue::as_text).unwrap_or("");
+            if !registry
+                .capabilities_for_name(parent_type)
+                .blocked_by_open_children
+            {
+                continue;
+            }
             if parent_id.is_empty() || blocker.is_empty() {
                 continue;
             }
@@ -10670,6 +10816,7 @@ impl SqliteStorage {
     fn load_local_open_child_blockers_for_ids_impl(
         conn: &Connection,
         parent_ids: &HashSet<String>,
+        registry: &crate::close_policy::TypeCapabilityRegistry,
     ) -> Result<HashMap<String, Vec<String>>> {
         if parent_ids.is_empty() {
             return Ok(HashMap::new());
@@ -10682,17 +10829,16 @@ impl SqliteStorage {
             let placeholders: Vec<&str> = chunk.iter().map(|_| "?").collect();
             // Join on the parent issue (p) to guarantee depends_on_id exists
             // in the issues table — same guard as the non-ids variant (#215).
-            // Epic-only scoping matches the non-ids variant: the "parent
-            // blocked by open children" rollup is epic-specific, not a
-            // property of every parent-child edge.
+            // Capability scoping matches the non-ids variant: the "parent
+            // blocked by open children" rollup is type policy, not a property
+            // of every parent-child edge.
             let sql = format!(
-                "SELECT DISTINCT d.depends_on_id as parent_id, d.issue_id || '{CHILD_OPEN_BLOCKER_SUFFIX}' as blocker
+                "SELECT DISTINCT d.depends_on_id as parent_id, d.issue_id || '{CHILD_OPEN_BLOCKER_SUFFIX}' as blocker, p.issue_type
                  FROM dependencies d
                  JOIN issues i ON d.issue_id = i.id
                  JOIN issues p ON d.depends_on_id = p.id
                  WHERE d.depends_on_id IN ({})
                    AND d.type = 'parent-child'
-                   AND p.issue_type = 'epic'
                    AND i.status NOT IN ('closed', 'tombstone')
                    AND (i.is_template = 0 OR i.is_template IS NULL)
                    AND d.depends_on_id NOT LIKE 'external:%'
@@ -10712,6 +10858,13 @@ impl SqliteStorage {
                 let Some(blocker) = row.get(1).and_then(SqliteValue::as_text) else {
                     continue;
                 };
+                let parent_type = row.get(2).and_then(SqliteValue::as_text).unwrap_or("");
+                if !registry
+                    .capabilities_for_name(parent_type)
+                    .blocked_by_open_children
+                {
+                    continue;
+                }
                 if parent_id.is_empty() || blocker.is_empty() {
                     continue;
                 }
@@ -10781,8 +10934,11 @@ impl SqliteStorage {
     ) -> Result<Vec<(Issue, Vec<String>)>> {
         // Read-only path: if the cache is stale, compute in memory instead of
         // persisting (issue #216 — read ops must not write).
-        if self.blocked_cache_marked_stale()? {
-            let blocked_issues_map = match Self::compute_blocked_issues_map_impl(&self.conn) {
+        if self.blocked_cache_marked_stale()? || !self.issue_type_registry.is_builtin_only() {
+            let blocked_issues_map = match Self::compute_blocked_issues_map_impl(
+                &self.conn,
+                &self.issue_type_registry,
+            ) {
                 Ok(map) => map,
                 Err(error) => {
                     self.recover_blocked_issues_map("get_blocked_issues_stale", &error)?
@@ -10842,6 +10998,9 @@ impl SqliteStorage {
     ///
     /// Returns an error if the blocked-cache stale marker cannot be read.
     pub fn may_have_blocked_command_results(&self) -> Result<bool> {
+        if !self.issue_type_registry.is_builtin_only() {
+            return Ok(true);
+        }
         if self.blocked_cache_marked_stale()? {
             return Ok(true);
         }
@@ -10916,23 +11075,33 @@ impl SqliteStorage {
             return Ok(true);
         }
 
-        let parent_sql = if blocking_only {
-            "SELECT 1
+        if blocking_only {
+            let rows = self.conn.query(
+                "SELECT p.issue_type
              FROM dependencies d INDEXED BY idx_dependencies_issue
              JOIN issues p ON d.depends_on_id = p.id
              WHERE d.issue_id >= 'external:'
                AND d.issue_id < 'external;'
                AND d.type = 'parent-child'
-               AND p.issue_type = 'epic'
-             LIMIT 1"
-        } else {
-            "SELECT 1
+             ",
+            )?;
+            return Ok(rows.iter().any(|row| {
+                row.get(0)
+                    .and_then(SqliteValue::as_text)
+                    .is_some_and(|issue_type| {
+                        self.issue_type_registry
+                            .capabilities_for_name(issue_type)
+                            .blocked_by_open_children
+                    })
+            }));
+        }
+
+        let parent_sql = "SELECT 1
              FROM dependencies INDEXED BY idx_dependencies_issue
              WHERE issue_id >= 'external:'
                AND issue_id < 'external;'
                AND type = 'parent-child'
-             LIMIT 1"
-        };
+             LIMIT 1";
         let rows = self.conn.query(parent_sql)?;
         Ok(!rows.is_empty())
     }
@@ -11056,21 +11225,27 @@ impl SqliteStorage {
             }
         }
 
-        // 2. Local epic parents blocked by external children. This mirrors
-        // `load_local_open_child_blockers_impl`: child-open rollup is an epic
-        // aggregation rule, not a property of every parent-child edge.
+        // 2. Local aggregate parents whose active policy treats open children
+        // as blockers.
         let rows = self.conn.query(
-            "SELECT d.depends_on_id, d.issue_id
+            "SELECT d.depends_on_id, d.issue_id, p.issue_type
              FROM dependencies d
              JOIN issues p ON d.depends_on_id = p.id
              WHERE d.issue_id LIKE 'external:%'
-               AND d.type = 'parent-child'
-               AND p.issue_type = 'epic'",
+               AND d.type = 'parent-child'",
         )?;
 
         for row in &rows {
             let parent_id = row.get(0).and_then(SqliteValue::as_text).unwrap_or("");
             let child_id = row.get(1).and_then(SqliteValue::as_text).unwrap_or("");
+            let parent_type = row.get(2).and_then(SqliteValue::as_text).unwrap_or("");
+            if !self
+                .issue_type_registry
+                .capabilities_for_name(parent_type)
+                .blocked_by_open_children
+            {
+                continue;
+            }
             let satisfied = external_statuses.get(child_id).copied().unwrap_or(false);
             if !satisfied {
                 blockers
@@ -11134,27 +11309,42 @@ impl SqliteStorage {
 
     fn list_external_dependency_ids(&self, blocking_only: bool) -> Result<HashSet<String>> {
         let mut ids = HashSet::new();
-        let sql = if blocking_only {
-            "SELECT DISTINCT depends_on_id
-             FROM dependencies
-             WHERE depends_on_id LIKE 'external:%'
-               AND type IN ('blocks', 'conditional-blocks', 'waits-for')
-             UNION
-             SELECT DISTINCT d.issue_id
-             FROM dependencies d
-             JOIN issues p ON d.depends_on_id = p.id
-             WHERE d.issue_id LIKE 'external:%'
-               AND d.type = 'parent-child'
-               AND p.issue_type = 'epic'"
-        } else {
-            "SELECT DISTINCT depends_on_id
+        if blocking_only {
+            let rows = self.conn.query(
+                "SELECT DISTINCT depends_on_id, NULL
+                 FROM dependencies
+                 WHERE depends_on_id LIKE 'external:%'
+                   AND type IN ('blocks', 'conditional-blocks', 'waits-for')
+                 UNION
+                 SELECT DISTINCT d.issue_id, p.issue_type
+                 FROM dependencies d
+                 JOIN issues p ON d.depends_on_id = p.id
+                 WHERE d.issue_id LIKE 'external:%'
+                   AND d.type = 'parent-child'",
+            )?;
+            for row in &rows {
+                let Some(id) = row.get(0).and_then(SqliteValue::as_text) else {
+                    continue;
+                };
+                let parent_type = row.get(1).and_then(SqliteValue::as_text);
+                if parent_type.is_none_or(|issue_type| {
+                    self.issue_type_registry
+                        .capabilities_for_name(issue_type)
+                        .blocked_by_open_children
+                }) {
+                    ids.insert(id.to_string());
+                }
+            }
+            return Ok(ids);
+        }
+
+        let sql = "SELECT DISTINCT depends_on_id
              FROM dependencies
              WHERE depends_on_id LIKE 'external:%'
              UNION
              SELECT DISTINCT issue_id
              FROM dependencies
-             WHERE issue_id LIKE 'external:%'"
-        };
+             WHERE issue_id LIKE 'external:%'";
 
         let rows = self.conn.query(sql)?;
         for row in &rows {
@@ -11253,6 +11443,8 @@ impl SqliteStorage {
             "conditional-blocks" => Some("conditional-blocks"),
             "waits-for" => Some("waits-for"),
             "related" => Some("related"),
+            "derived-from" => Some("derived-from"),
+            "implements" => Some("implements"),
             "discovered-from" => Some("discovered-from"),
             "replies-to" => Some("replies-to"),
             "relates-to" => Some("relates-to"),
@@ -11292,12 +11484,12 @@ impl SqliteStorage {
     fn existing_dependency_targets_for_issue_ids(
         conn: &Connection,
         issue_ids: &[&str],
-    ) -> Result<HashMap<String, HashSet<String>>> {
-        let mut targets_by_issue_id: HashMap<String, HashSet<String>> = HashMap::new();
+    ) -> Result<HashMap<String, HashSet<(String, String)>>> {
+        let mut targets_by_issue_id: HashMap<String, HashSet<(String, String)>> = HashMap::new();
         for chunk in issue_ids.chunks(SQLITE_VAR_LIMIT) {
             let placeholders: Vec<&str> = chunk.iter().map(|_| "?").collect();
             let sql = format!(
-                "SELECT issue_id, depends_on_id FROM dependencies WHERE issue_id IN ({})",
+                "SELECT issue_id, depends_on_id, type FROM dependencies WHERE issue_id IN ({})",
                 placeholders.join(",")
             );
             let params: Vec<SqliteValue> = chunk
@@ -11312,10 +11504,13 @@ impl SqliteStorage {
                 let Some(depends_on_id) = row.get(1).and_then(SqliteValue::as_text) else {
                     continue;
                 };
+                let Some(dep_type) = row.get(2).and_then(SqliteValue::as_text) else {
+                    continue;
+                };
                 targets_by_issue_id
                     .entry(issue_id.to_string())
                     .or_default()
-                    .insert(depends_on_id.to_string());
+                    .insert((depends_on_id.to_string(), dep_type.to_ascii_lowercase()));
             }
         }
 
@@ -11547,10 +11742,11 @@ impl SqliteStorage {
             }
 
             let existing = conn.query_with_params(
-                "SELECT 1 FROM dependencies WHERE issue_id = ? AND depends_on_id = ? LIMIT 1",
+                "SELECT 1 FROM dependencies WHERE issue_id = ? AND depends_on_id = ? AND type = ? LIMIT 1",
                 &[
                     SqliteValue::from(issue_id),
                     SqliteValue::from(depends_on_id),
+                    SqliteValue::from(dep_type),
                 ],
             )?;
             if !existing.is_empty() {
@@ -11689,7 +11885,9 @@ impl SqliteStorage {
 
                 if existing_targets
                     .get(dep.issue_id.as_str())
-                    .is_some_and(|targets| targets.contains(dep.depends_on_id.as_str()))
+                    .is_some_and(|targets| {
+                        targets.contains(&(dep.depends_on_id.clone(), dep_type.clone()))
+                    })
                 {
                     continue;
                 }
@@ -11722,7 +11920,11 @@ impl SqliteStorage {
                     }
                 }
 
-                if seen_edges.insert((dep.issue_id.clone(), dep.depends_on_id.clone())) {
+                if seen_edges.insert((
+                    dep.issue_id.clone(),
+                    dep.depends_on_id.clone(),
+                    dep_type.clone(),
+                )) {
                     unique_dependencies.push((dep, dep_type));
                 }
             }
@@ -11818,14 +12020,65 @@ impl SqliteStorage {
         depends_on_id: &str,
         actor: &str,
     ) -> Result<bool> {
+        self.remove_dependency_typed(issue_id, depends_on_id, None, actor)
+    }
+
+    /// Remove one typed dependency, or the sole relation for an untyped pair.
+    ///
+    /// # Errors
+    ///
+    /// Returns an ambiguity error when an untyped pair has multiple relations.
+    pub fn remove_dependency_typed(
+        &mut self,
+        issue_id: &str,
+        depends_on_id: &str,
+        dep_type: Option<&str>,
+        actor: &str,
+    ) -> Result<bool> {
         self.mutate("remove_dependency", actor, |conn, ctx| {
             Self::ensure_issue_mutable_in_tx(conn, issue_id, "remove dependency from")?;
 
+            let canonical_type = dep_type
+                .map(|value| Self::canonical_standard_dependency_type(value).unwrap_or(value));
+            let selected_type = if let Some(dep_type) = canonical_type {
+                Some(dep_type.to_string())
+            } else {
+                let rows = conn.query_with_params(
+                    "SELECT type FROM dependencies WHERE issue_id = ? AND depends_on_id = ? ORDER BY type",
+                    &[
+                        SqliteValue::from(issue_id),
+                        SqliteValue::from(depends_on_id),
+                    ],
+                )?;
+                let types: Vec<String> = rows
+                    .iter()
+                    .filter_map(|row| row.get(0).and_then(SqliteValue::as_text).map(str::to_string))
+                    .collect();
+                match types.as_slice() {
+                    [] => None,
+                    [only] => Some(only.clone()),
+                    _ => {
+                        return Err(BeadsError::Validation {
+                            field: "type".to_string(),
+                            reason: format!(
+                                "ambiguous dependency {issue_id} -> {depends_on_id}; choose --type from: {}",
+                                types.join(", ")
+                            ),
+                        });
+                    }
+                }
+            };
+
+            let Some(selected_type) = selected_type else {
+                return Ok(false);
+            };
+
             let rows = conn.execute_with_params(
-                "DELETE FROM dependencies WHERE issue_id = ? AND depends_on_id = ?",
+                "DELETE FROM dependencies WHERE issue_id = ? AND depends_on_id = ? AND type = ?",
                 &[
                     SqliteValue::from(issue_id),
                     SqliteValue::from(depends_on_id),
+                    SqliteValue::from(selected_type.as_str()),
                 ],
             )?;
 
@@ -11841,7 +12094,9 @@ impl SqliteStorage {
                 ctx.record_event(
                     EventType::DependencyRemoved,
                     issue_id,
-                    Some(format!("Removed dependency on {depends_on_id}")),
+                    Some(format!(
+                        "Removed dependency on {depends_on_id} ({selected_type})"
+                    )),
                 );
                 ctx.mark_dirty(issue_id);
                 // Defer rebuild for the same reason as add_dependency_with_metadata.
@@ -13492,6 +13747,311 @@ impl SqliteStorage {
         Ok(max_child.saturating_add(1))
     }
 
+    /// Generate a top-level or child issue ID under the configured policy.
+    ///
+    /// This is the single storage-aware generation boundary: collision checks,
+    /// child allocation, template validation, title-derived slugs, and sequence
+    /// allocation all use the same database generation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for missing parents, invalid templates, exhausted child
+    /// or sequence counters, collision lookup failures, or saturated IDs.
+    pub fn generate_issue_id(
+        &self,
+        config: &IdConfig,
+        input: IdGenerationInput<'_>,
+        parent_id: Option<&str>,
+        slug: Option<&str>,
+        sequence_allocation: IssueSequenceAllocation,
+    ) -> Result<GeneratedIssueId> {
+        if let Some(parent_id) = parent_id {
+            if !self.id_exists(parent_id)? {
+                return Err(BeadsError::IssueNotFound {
+                    id: parent_id.to_string(),
+                });
+            }
+
+            let next_num = self.next_child_number(parent_id)?;
+            let candidate = child_id(parent_id, next_num);
+            if !self.id_exists(&candidate)? {
+                return Ok(GeneratedIssueId {
+                    id: candidate,
+                    sequence_number: None,
+                });
+            }
+
+            let first_alternate = next_num
+                .checked_add(1)
+                .ok_or_else(|| BeadsError::validation("parent", "child ID counter exhausted"))?;
+            for num in first_alternate..=next_num.saturating_add(100) {
+                let alternate = child_id(parent_id, num);
+                if !self.id_exists(&alternate)? {
+                    return Ok(GeneratedIssueId {
+                        id: alternate,
+                        sequence_number: None,
+                    });
+                }
+            }
+            return Err(BeadsError::validation(
+                "parent",
+                "could not find available child ID",
+            ));
+        }
+
+        let generator = IdGenerator::new(config.clone());
+        if config.generation.mode == IdGenerationMode::Templated {
+            generator.validate_template_config()?;
+            let sequence_number = if config.generation.template.contains("{seq") {
+                Some(match sequence_allocation {
+                    IssueSequenceAllocation::Allocate => self.allocate_issue_sequence_number()?,
+                    IssueSequenceAllocation::Preview => self.peek_issue_sequence_number()?,
+                })
+            } else {
+                None
+            };
+            let effective_slug = slug
+                .filter(|value| !value.trim().is_empty())
+                .or(Some(input.title));
+            let id = generator.generate_with_template(
+                input,
+                sequence_number,
+                effective_slug,
+                |candidate| self.id_exists(candidate),
+            )?;
+            return Ok(GeneratedIssueId {
+                id,
+                sequence_number,
+            });
+        }
+
+        let id = match slug.filter(|value| !value.trim().is_empty()) {
+            Some(slug) => {
+                generator.generate_with_slug(input, slug, |candidate| self.id_exists(candidate))?
+            }
+            None => generator.generate(
+                input.title,
+                input.description,
+                input.creator,
+                input.created_at,
+                input.issue_count,
+                |candidate| self.id_exists(candidate),
+            )?,
+        };
+        Ok(GeneratedIssueId {
+            id,
+            sequence_number: None,
+        })
+    }
+
+    /// Allocate the next monotonic issue sequence number for templated IDs.
+    ///
+    /// The counter is intentionally advanced in its own write transaction.
+    /// Numbers are never reused, even if the later issue creation fails.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the counter cannot be read or advanced.
+    pub fn allocate_issue_sequence_number(&self) -> Result<IssueSequenceNumber> {
+        self.with_connection_write_transaction(|_| {
+            let current = Self::read_issue_sequence_counter_on_conn(&self.conn)?;
+            let next = current.checked_successor()?;
+            Self::write_issue_sequence_counter_on_conn(&self.conn, next)?;
+            Ok(current)
+        })
+    }
+
+    /// Read the next issue sequence number without advancing it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the counter cannot be read.
+    pub fn peek_issue_sequence_number(&self) -> Result<IssueSequenceNumber> {
+        match self.conn.query_row_with_params(
+            "SELECT next_value FROM id_counters WHERE name = ?",
+            &[SqliteValue::from("issue")],
+        ) {
+            Ok(row) => {
+                IssueSequenceNumber::new(row.get(0).and_then(SqliteValue::as_integer).unwrap_or(1))
+            }
+            Err(fsqlite_error::FrankenError::QueryReturnedNoRows) => IssueSequenceNumber::new(1),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    /// Bind a sequence number to an issue and advance the local counter past it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the sequence row or counter cannot be written.
+    pub fn record_issue_sequence_number(
+        &self,
+        issue_id: &str,
+        sequence_number: IssueSequenceNumber,
+    ) -> Result<()> {
+        self.with_connection_write_transaction(|_| {
+            self.record_issue_sequence_number_in_tx(issue_id, sequence_number)
+        })
+    }
+
+    /// Transaction-scoped sequence recording helper.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the sequence row or counter cannot be written.
+    pub fn record_issue_sequence_number_in_tx(
+        &self,
+        issue_id: &str,
+        sequence_number: IssueSequenceNumber,
+    ) -> Result<()> {
+        Self::record_issue_sequence_number_on_conn(&self.conn, issue_id, sequence_number)
+    }
+
+    fn record_issue_sequence_number_on_conn(
+        conn: &Connection,
+        issue_id: &str,
+        sequence_number: IssueSequenceNumber,
+    ) -> Result<()> {
+        conn.execute_with_params(
+            "DELETE FROM issue_sequences WHERE issue_id = ?",
+            &[SqliteValue::from(issue_id)],
+        )?;
+        conn.execute_with_params(
+            "INSERT INTO issue_sequences (issue_id, sequence_number) VALUES (?, ?)",
+            &[
+                SqliteValue::from(issue_id),
+                SqliteValue::from(sequence_number.get()),
+            ],
+        )?;
+        let minimum_next_value = sequence_number.checked_successor()?;
+        Self::advance_issue_sequence_counter_on_conn(conn, minimum_next_value)
+    }
+
+    pub(crate) fn advance_issue_sequence_counter_in_tx(
+        &self,
+        minimum_next_value: IssueSequenceNumber,
+    ) -> Result<()> {
+        Self::advance_issue_sequence_counter_on_conn(&self.conn, minimum_next_value)
+    }
+
+    fn advance_issue_sequence_counter_on_conn(
+        conn: &Connection,
+        minimum_next_value: IssueSequenceNumber,
+    ) -> Result<()> {
+        let current = Self::read_issue_sequence_counter_on_conn(conn)?;
+        if current.get() >= minimum_next_value.get() {
+            return Ok(());
+        }
+        Self::write_issue_sequence_counter_on_conn(conn, minimum_next_value)
+    }
+
+    fn read_issue_sequence_counter_on_conn(conn: &Connection) -> Result<IssueSequenceNumber> {
+        let value = match conn.query_row_with_params(
+            "SELECT next_value FROM id_counters WHERE name = ?",
+            &[SqliteValue::from("issue")],
+        ) {
+            Ok(row) => row.get(0).and_then(SqliteValue::as_integer).unwrap_or(1),
+            Err(fsqlite_error::FrankenError::QueryReturnedNoRows) => 1,
+            Err(error) => return Err(error.into()),
+        };
+        IssueSequenceNumber::new(value)
+    }
+
+    fn write_issue_sequence_counter_on_conn(
+        conn: &Connection,
+        next_value: IssueSequenceNumber,
+    ) -> Result<()> {
+        conn.execute_with_params(
+            "DELETE FROM id_counters WHERE name = ?",
+            &[SqliteValue::from("issue")],
+        )?;
+        conn.execute_with_params(
+            "INSERT INTO id_counters (name, next_value) VALUES (?, ?)",
+            &[
+                SqliteValue::from("issue"),
+                SqliteValue::from(next_value.get()),
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Return the sequence number recorded for an issue, if any.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the lookup fails.
+    pub fn issue_sequence_number(&self, issue_id: &str) -> Result<Option<IssueSequenceNumber>> {
+        match self.conn.query_row_with_params(
+            "SELECT sequence_number FROM issue_sequences WHERE issue_id = ?",
+            &[SqliteValue::from(issue_id)],
+        ) {
+            Ok(row) => row
+                .get(0)
+                .and_then(SqliteValue::as_integer)
+                .map(IssueSequenceNumber::new)
+                .transpose(),
+            Err(fsqlite_error::FrankenError::QueryReturnedNoRows) => Ok(None),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    /// Return sequence numbers for the given issue IDs.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the lookup fails.
+    pub fn issue_sequence_numbers_for_ids(
+        &self,
+        issue_ids: &[String],
+    ) -> Result<HashMap<String, IssueSequenceNumber>> {
+        if issue_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let mut result = HashMap::new();
+        for chunk in issue_ids.chunks(450) {
+            let placeholders = vec!["?"; chunk.len()].join(", ");
+            let sql = format!(
+                "SELECT issue_id, sequence_number FROM issue_sequences WHERE issue_id IN ({placeholders})"
+            );
+            let params: Vec<SqliteValue> = chunk
+                .iter()
+                .map(|id| SqliteValue::from(id.as_str()))
+                .collect();
+            let rows = self.conn.query_with_params(&sql, &params)?;
+            for row in &rows {
+                if let (Some(issue_id), Some(sequence_number)) = (
+                    row.get(0).and_then(SqliteValue::as_text),
+                    row.get(1).and_then(SqliteValue::as_integer),
+                ) {
+                    result.insert(
+                        issue_id.to_string(),
+                        IssueSequenceNumber::new(sequence_number)?,
+                    );
+                }
+            }
+        }
+        Ok(result)
+    }
+
+    /// Find full IDs assigned the given sequence number.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the lookup fails.
+    pub fn find_ids_by_sequence(
+        &self,
+        sequence_number: IssueSequenceNumber,
+    ) -> Result<Vec<String>> {
+        let rows = self.conn.query_with_params(
+            "SELECT issue_id FROM issue_sequences WHERE sequence_number = ? ORDER BY issue_id",
+            &[SqliteValue::from(sequence_number.get())],
+        )?;
+        Ok(rows
+            .iter()
+            .filter_map(|row| row.get(0).and_then(SqliteValue::as_text).map(String::from))
+            .collect())
+    }
+
     /// Internal helper to update a child counter within a transaction.
     fn update_child_counter_in_tx(
         conn: &Connection,
@@ -13790,6 +14350,32 @@ impl SqliteStorage {
         &self,
         issue_ids: &[String],
     ) -> Result<(HashMap<String, usize>, HashMap<String, usize>)> {
+        self.count_relation_counts_for_issues_filtered(issue_ids, "")
+    }
+
+    /// Count only execution-affecting relations for scheduler evidence.
+    ///
+    /// Informational and traceability relations deliberately contribute zero
+    /// so adding provenance cannot reorder otherwise-identical ready work.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database query fails.
+    pub fn count_scheduler_relation_counts_for_issues(
+        &self,
+        issue_ids: &[String],
+    ) -> Result<(HashMap<String, usize>, HashMap<String, usize>)> {
+        self.count_relation_counts_for_issues_filtered(
+            issue_ids,
+            " AND type IN ('blocks','conditional-blocks','waits-for','parent-child')",
+        )
+    }
+
+    fn count_relation_counts_for_issues_filtered(
+        &self,
+        issue_ids: &[String],
+        relation_filter: &str,
+    ) -> Result<(HashMap<String, usize>, HashMap<String, usize>)> {
         // Stay below SQLite's common 999-variable ceiling while keeping the
         // default scheduler candidate window to one evidence-loading round trip.
         // Avoid CTE VALUES materialization, which is the primary root-page
@@ -13814,7 +14400,8 @@ impl SqliteStorage {
 
             // Query dependency counts (issue_id = the issue that depends on something)
             let dep_sql = format!(
-                "SELECT issue_id, COUNT(*) FROM dependencies WHERE issue_id IN ({joined}) GROUP BY issue_id"
+                "SELECT issue_id, COUNT(*) FROM dependencies \
+                 WHERE issue_id IN ({joined}){relation_filter} GROUP BY issue_id"
             );
             let rows = self.conn.query_with_params(&dep_sql, &params)?;
             for row in &rows {
@@ -13832,7 +14419,8 @@ impl SqliteStorage {
 
             // Query dependent counts (depends_on_id = the issue that others depend on)
             let dpt_sql = format!(
-                "SELECT depends_on_id, COUNT(*) FROM dependencies WHERE depends_on_id IN ({joined}) GROUP BY depends_on_id"
+                "SELECT depends_on_id, COUNT(*) FROM dependencies \
+                 WHERE depends_on_id IN ({joined}){relation_filter} GROUP BY depends_on_id"
             );
             let rows = self.conn.query_with_params(&dpt_sql, &params)?;
             for row in &rows {
@@ -14078,7 +14666,7 @@ impl SqliteStorage {
         let rows = self.conn.query(
             "SELECT issue_id, depends_on_id, type, created_at, created_by, metadata, thread_id
              FROM dependencies
-             ORDER BY issue_id, depends_on_id",
+             ORDER BY issue_id, depends_on_id, type",
         )?;
 
         let mut map: HashMap<String, Vec<Dependency>> = HashMap::new();
@@ -14131,7 +14719,7 @@ impl SqliteStorage {
              INNER JOIN issues ON issues.id = dependencies.issue_id
              WHERE (issues.ephemeral = 0 OR issues.ephemeral IS NULL)
                AND issues.id NOT LIKE '%-wisp-%'
-             ORDER BY dependencies.issue_id, dependencies.depends_on_id",
+             ORDER BY dependencies.issue_id, dependencies.depends_on_id, dependencies.type",
         )?;
 
         let mut map: HashMap<String, Vec<Dependency>> = HashMap::new();
@@ -15547,13 +16135,13 @@ fn finish_issue_mutation_write_probe(
             BeadsError::Config(
                 "issue write probe succeeded but its rollback cleanup failed".to_string(),
             ),
-            rollback_err,
+            &rollback_err,
             "successful issue write probe",
         )),
         (Err(probe_err), Ok(_)) => Err(BeadsError::Database(probe_err)),
         (Err(probe_err), Err(rollback_err)) => Err(SqliteStorage::rollback_failure_error(
             BeadsError::Database(probe_err),
-            rollback_err,
+            &rollback_err,
             "issue write probe error",
         )),
     }
@@ -15623,7 +16211,8 @@ fn heal_namespace_sidecar_modes(db_path: &Path) -> Result<()> {
                 continue;
             }
             let mode = metadata.permissions().mode();
-            if mode & 0o077 == 0 {
+            // No group/other permission bits means the mode is a multiple of 0o100.
+            if mode.is_multiple_of(0o100) {
                 continue;
             }
 
@@ -16740,6 +17329,34 @@ impl SqliteStorage {
         Ok(count > 0)
     }
 
+    /// Check whether one exact typed dependency exists between two issues.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database query fails.
+    pub fn dependency_exists_typed_between(
+        &self,
+        issue_id: &str,
+        depends_on_id: &str,
+        dep_type: &DependencyType,
+    ) -> Result<bool> {
+        let count = self
+            .conn
+            .query_row_with_params(
+                "SELECT COUNT(*) FROM dependencies \
+                 WHERE issue_id = ? AND depends_on_id = ? AND type = ?",
+                &[
+                    SqliteValue::from(issue_id),
+                    SqliteValue::from(depends_on_id),
+                    SqliteValue::from(dep_type.as_str()),
+                ],
+            )?
+            .get(0)
+            .and_then(SqliteValue::as_integer)
+            .unwrap_or(0);
+        Ok(count > 0)
+    }
+
     /// Check if adding a standard dependency edge would create a cycle.
     ///
     /// If `blocking_only` is true, only considers dependency types that affect ready-work
@@ -17529,10 +18146,8 @@ impl SqliteStorage {
                 &dep.depends_on_id,
                 dep.dep_type.as_str(),
             )?;
-            // Deduplicate by target because the dependencies table is keyed by
-            // (issue_id, depends_on_id). Type-distinct duplicates would be
-            // ignored by insertion anyway.
-            if seen_deps.insert(dep.depends_on_id.as_str()) {
+            // Dependency identity includes the ordered pair and relation type.
+            if seen_deps.insert((dep.depends_on_id.as_str(), dep.dep_type.as_str())) {
                 unique_deps.push(dep);
             }
         }
@@ -17655,6 +18270,8 @@ impl SqliteStorage {
     /// # Errors
     ///
     /// Returns an error if validation or any database operation fails.
+    // The validation, mutation, and durable receipt must remain one transaction boundary.
+    #[allow(clippy::too_many_lines)]
     pub(crate) fn apply_sync_merge_atomically(
         &mut self,
         kept: &[Issue],
@@ -17907,7 +18524,7 @@ impl SqliteStorage {
                 if !was_terminal {
                     storage.insert_sync_merge_event_in_tx(
                         &tombstone.id,
-                        EventType::Deleted,
+                        &EventType::Deleted,
                         actor,
                         Some("Deleted issue: merge deletion"),
                         &created_at,
@@ -17922,6 +18539,9 @@ impl SqliteStorage {
             // rows do not depend on report ordering.
             for issue in kept {
                 storage.upsert_issue_for_import_in_tx(issue)?;
+            }
+            for (issue_id, sequence_number) in &intent.sequence_numbers {
+                storage.record_issue_sequence_number_in_tx(issue_id, *sequence_number)?;
             }
             for issue in kept {
                 storage.sync_labels_for_import_in_tx(&issue.id, &issue.labels)?;
@@ -17950,7 +18570,7 @@ impl SqliteStorage {
                 )?;
                 storage.insert_sync_merge_event_in_tx(
                     issue_id,
-                    EventType::Commented,
+                    &EventType::Commented,
                     actor,
                     Some(note),
                     &created_at,
@@ -18010,7 +18630,7 @@ impl SqliteStorage {
     fn insert_sync_merge_event_in_tx(
         &self,
         issue_id: &str,
-        event_type: EventType,
+        event_type: &EventType,
         actor: &str,
         comment: Option<&str>,
         created_at: &str,
@@ -18138,9 +18758,7 @@ impl SqliteStorage {
             });
         }
         authority.verify_database_authority()?;
-        let mut storage = if let Some(storage) = Self::open_current_read_only(path)? {
-            storage
-        } else {
+        let Some(mut storage) = Self::open_current_read_only(path)? else {
             let found = effective_database_user_version(path)?;
             return match found {
                 Some(found) => Err(BeadsError::SchemaMismatch {
@@ -18162,7 +18780,7 @@ impl SqliteStorage {
     pub(crate) fn pending_sync_merge_receipt(&self) -> Result<Option<SyncMergePendingReceipt>> {
         match self.inspect_pending_sync_merge()? {
             PendingSyncMergeInspection::Absent => Ok(None),
-            PendingSyncMergeInspection::Valid(receipt) => Ok(Some(receipt)),
+            PendingSyncMergeInspection::Valid(receipt) => Ok(Some(*receipt)),
             pending @ (PendingSyncMergeInspection::Legacy { .. }
             | PendingSyncMergeInspection::Malformed { .. }) => Err(BeadsError::SyncConflict {
                 message: format!(
@@ -18251,19 +18869,18 @@ impl SqliteStorage {
         expected: &SyncMergePendingReceipt,
     ) -> Result<()> {
         expected.validate()?;
-        let terminal_raw_sha256 = match (expected.phase, expected.jsonl_after.as_ref()) {
-            (
-                crate::sync::SyncMergePendingPhase::ExportFinalized,
-                Some(crate::sync::JsonlSourceStateWitness::Present { raw_sha256, .. }),
-            ) => raw_sha256,
-            _ => {
-                return Err(BeadsError::SyncConflict {
-                    message:
-                        "Pending sync merge receipt may be cleared only after exact export finalization"
-                            .to_string(),
-                });
-            }
+        let (
+            crate::sync::SyncMergePendingPhase::ExportFinalized,
+            Some(crate::sync::JsonlSourceStateWitness::Present { raw_sha256, .. }),
+        ) = (expected.phase, expected.jsonl_after.as_ref())
+        else {
+            return Err(BeadsError::SyncConflict {
+                message:
+                    "Pending sync merge receipt may be cleared only after exact export finalization"
+                        .to_string(),
+            });
         };
+        let terminal_raw_sha256 = raw_sha256;
         if terminal_raw_sha256 != &expected.jsonl_after_raw_sha256 {
             return Err(BeadsError::SyncConflict {
                 message: "Terminal sync merge source witness does not match reviewed export bytes"
@@ -18434,8 +19051,9 @@ impl crate::validation::DependencyStore for SqliteStorage {
         &self,
         issue_id: &str,
         depends_on_id: &str,
+        dep_type: &DependencyType,
     ) -> std::result::Result<bool, crate::error::BeadsError> {
-        self.dependency_exists_between(issue_id, depends_on_id)
+        self.dependency_exists_typed_between(issue_id, depends_on_id, dep_type)
     }
 
     fn would_create_cycle(
@@ -18815,6 +19433,7 @@ mod tests {
             kept_issue_witnesses,
             deleted_issue_ids,
             note_witnesses,
+            sequence_numbers: Vec::new(),
             database_before: crate::sync::capture_sync_database_witness(storage).unwrap(),
         }
     }
@@ -18979,7 +19598,7 @@ mod tests {
         let canonical = serde_json::to_string(&receipt).unwrap();
         assert!(matches!(
             classify_pending_sync_merge_rows(&[Some(canonical)], &[]),
-            PendingSyncMergeInspection::Valid(observed) if observed == receipt
+            PendingSyncMergeInspection::Valid(observed) if observed.as_ref() == &receipt
         ));
 
         let pretty = serde_json::to_string_pretty(&receipt).unwrap();
@@ -19262,6 +19881,8 @@ mod tests {
     /// close routes through), before any row in the batch is mutated. An
     /// explicit `--bypass-policy` reason still gets through.
     #[test]
+    // Keep the batch preflight, rollback proof, and bypass proof in one fixture.
+    #[allow(clippy::too_many_lines)]
     fn forbidden_workflow_transition_is_rejected_for_whole_batch_before_mutation() {
         let mut transitions = std::collections::BTreeMap::new();
         transitions.insert("open".to_string(), vec!["in_progress".to_string()]);
@@ -22415,6 +23036,59 @@ mod tests {
     }
 
     #[test]
+    fn configured_type_controls_external_open_child_blocking() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let timestamp = Utc.with_ymd_and_hms(2025, 3, 4, 0, 0, 0).unwrap();
+        let mut map = make_issue("bd-map", "Map", Status::Open, 2, None, timestamp, None);
+        map.issue_type = IssueType::Custom("map".to_string());
+        storage.create_issue(&map, "tester").unwrap();
+        insert_external_parent_child_dependency(
+            &storage,
+            "external:extproj:decision",
+            "bd-map",
+            timestamp,
+        );
+
+        let non_blocking = crate::close_policy::IssueTypePolicy {
+            types: vec![crate::close_policy::IssueTypeDefinition {
+                name: "map".to_string(),
+                capabilities: crate::close_policy::IssueTypeCapabilityOverrides {
+                    blocked_by_open_children: Some(false),
+                    ..Default::default()
+                },
+                roadmap_role: None,
+            }],
+            ..Default::default()
+        };
+        storage.set_issue_type_registry(
+            crate::close_policy::TypeCapabilityRegistry::resolve(&non_blocking).unwrap(),
+        );
+        assert!(!storage.has_external_dependencies(true).unwrap());
+
+        let blocking = crate::close_policy::IssueTypePolicy {
+            types: vec![crate::close_policy::IssueTypeDefinition {
+                name: "map".to_string(),
+                capabilities: crate::close_policy::IssueTypeCapabilityOverrides {
+                    blocked_by_open_children: Some(true),
+                    ..Default::default()
+                },
+                roadmap_role: None,
+            }],
+            ..Default::default()
+        };
+        storage.set_issue_type_registry(
+            crate::close_policy::TypeCapabilityRegistry::resolve(&blocking).unwrap(),
+        );
+        assert!(storage.has_external_dependencies(true).unwrap());
+        let statuses = HashMap::from([("external:extproj:decision".to_string(), false)]);
+        let blockers = storage.external_blockers(&statuses).unwrap();
+        assert_eq!(
+            blockers.get("bd-map"),
+            Some(&vec!["external:extproj:decision:child-blocked".to_string()])
+        );
+    }
+
+    #[test]
     fn test_blocking_only_external_resolution_skips_non_epic_external_children() {
         let mut storage = SqliteStorage::open_memory().unwrap();
         let t1 = Utc.with_ymd_and_hms(2025, 3, 5, 0, 0, 0).unwrap();
@@ -24220,7 +24894,7 @@ mod tests {
     }
 
     #[test]
-    fn test_add_dependency_existing_pair_skips_cycle_check() {
+    fn test_add_dependency_type_distinct_pair_still_checks_cycle() {
         let mut storage = SqliteStorage::open_memory().unwrap();
         let t1 = Utc.with_ymd_and_hms(2025, 7, 2, 0, 0, 0).unwrap();
 
@@ -24236,11 +24910,11 @@ mod tests {
             .add_dependency("bd-existing-b", "bd-existing-a", "blocks", "tester")
             .unwrap();
 
-        let added = storage
+        let error = storage
             .add_dependency("bd-existing-a", "bd-existing-b", "blocks", "tester")
-            .expect("existing pair should return unchanged instead of false cycle");
+            .expect_err("a distinct blocking relation must still be checked for cycles");
 
-        assert!(!added);
+        assert!(matches!(error, BeadsError::DependencyCycle { .. }));
         let dep_types: Vec<String> = storage
             .get_dependencies_full("bd-existing-a")
             .unwrap()
@@ -24251,7 +24925,7 @@ mod tests {
     }
 
     #[test]
-    fn test_bulk_dependency_import_ignores_existing_pairs_before_cycle_check() {
+    fn test_bulk_dependency_import_checks_type_distinct_pairs_for_cycles() {
         let mut storage = SqliteStorage::open_memory().unwrap();
         let t1 = Utc.with_ymd_and_hms(2025, 7, 2, 0, 0, 0).unwrap();
 
@@ -24268,7 +24942,7 @@ mod tests {
             )
             .unwrap();
 
-        let inserted = storage
+        let error = storage
             .add_dependencies_bulk_for_import(
                 &[
                     BulkDependencyInsert {
@@ -24284,9 +24958,9 @@ mod tests {
                 ],
                 "tester",
             )
-            .expect("ignored duplicate pair should not create a false proposed cycle");
+            .expect_err("type-distinct blocking relations must participate in cycle checks");
 
-        assert_eq!(inserted, 1);
+        assert!(matches!(error, BeadsError::DependencyCycle { .. }));
         let dep_types_a: Vec<String> = storage
             .get_dependencies_full("bd-bulk-existing-a")
             .unwrap()
@@ -24296,7 +24970,8 @@ mod tests {
         assert_eq!(dep_types_a, vec!["related".to_string()]);
         assert_eq!(
             storage.get_dependencies("bd-bulk-existing-b").unwrap(),
-            vec!["bd-bulk-existing-a".to_string()]
+            Vec::<String>::new(),
+            "the rejected batch must not partially insert its reverse edge"
         );
     }
 
@@ -26531,7 +27206,9 @@ mod tests {
             .unwrap();
 
         let seed_ids = HashSet::from(["bd-parent.1".to_string()]);
-        SqliteStorage::incremental_blocked_cache_update(&storage.conn, &seed_ids).unwrap();
+        let registry = crate::close_policy::TypeCapabilityRegistry::default();
+        SqliteStorage::incremental_blocked_cache_update(&storage.conn, &seed_ids, &registry)
+            .unwrap();
 
         let parent_blockers = storage.get_blockers("bd-parent").unwrap();
         assert_eq!(
@@ -26543,6 +27220,130 @@ mod tests {
         assert_eq!(
             storage.get_blockers("bd-unrelated").unwrap(),
             vec!["bd-unrelated-blocker".to_string()]
+        );
+    }
+
+    #[test]
+    fn configured_type_capabilities_control_ready_and_child_blocking() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let now = Utc::now();
+        let mut map = make_issue("bd-map", "Map", Status::Open, 2, None, now, None);
+        map.issue_type = IssueType::Custom("map".to_string());
+        map.priority = Priority::CRITICAL;
+        let mut child = make_issue("bd-map.1", "Decision", Status::Open, 2, None, now, None);
+        child.priority = Priority::HIGH;
+        let mut custom = make_issue("bd-custom", "Custom", Status::Open, 2, None, now, None);
+        custom.issue_type = IssueType::Custom("unregistered".to_string());
+        for issue in [map, child, custom] {
+            storage.create_issue(&issue, "tester").unwrap();
+        }
+        storage
+            .add_dependency("bd-map.1", "bd-map", "parent-child", "tester")
+            .unwrap();
+
+        let policy = crate::close_policy::IssueTypePolicy {
+            types: vec![crate::close_policy::IssueTypeDefinition {
+                name: "map".to_string(),
+                capabilities: crate::close_policy::IssueTypeCapabilityOverrides {
+                    aggregate: Some(true),
+                    ready_work: Some(false),
+                    blocked_by_open_children: Some(false),
+                    ..Default::default()
+                },
+                roadmap_role: None,
+            }],
+            ..Default::default()
+        };
+        storage.set_issue_type_registry(
+            crate::close_policy::TypeCapabilityRegistry::resolve(&policy).unwrap(),
+        );
+
+        assert!(
+            !storage.is_blocked("bd-map").unwrap(),
+            "configured map must not be blocked by its open decision"
+        );
+        let ready = storage
+            .get_ready_issues(&ReadyFilters::default(), ReadySortPolicy::Priority)
+            .unwrap();
+        let ready_ids: HashSet<_> = ready.into_iter().map(|issue| issue.id).collect();
+        assert!(!ready_ids.contains("bd-map"));
+        assert!(ready_ids.contains("bd-map.1"));
+        assert!(
+            ready_ids.contains("bd-custom"),
+            "unregistered custom types retain neutral ready behavior"
+        );
+        let limited_ready = storage
+            .get_ready_issues(
+                &ReadyFilters {
+                    limit: Some(1),
+                    ..Default::default()
+                },
+                ReadySortPolicy::Priority,
+            )
+            .unwrap();
+        assert_eq!(limited_ready.len(), 1);
+        assert_eq!(
+            limited_ready[0].id, "bd-map.1",
+            "excluded aggregates must not consume the candidate limit"
+        );
+
+        let blocking_policy = crate::close_policy::IssueTypePolicy {
+            types: vec![crate::close_policy::IssueTypeDefinition {
+                name: "map".to_string(),
+                capabilities: crate::close_policy::IssueTypeCapabilityOverrides {
+                    blocked_by_open_children: Some(true),
+                    ..Default::default()
+                },
+                roadmap_role: None,
+            }],
+            ..Default::default()
+        };
+        storage.set_issue_type_registry(
+            crate::close_policy::TypeCapabilityRegistry::resolve(&blocking_policy).unwrap(),
+        );
+        assert!(
+            storage.is_blocked("bd-map").unwrap(),
+            "active policy must bypass a cache built under older semantics"
+        );
+        storage.rebuild_blocked_cache(true).unwrap();
+        assert!(storage.is_blocked("bd-map").unwrap());
+    }
+
+    #[test]
+    fn custom_blocked_cache_projection_stays_stale_when_policy_is_disabled() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let now = Utc::now();
+        let mut epic = make_issue("bd-epic", "Epic", Status::Open, 2, None, now, None);
+        epic.issue_type = IssueType::Epic;
+        let child = make_issue("bd-epic.1", "Child", Status::Open, 2, None, now, None);
+        storage.create_issue(&epic, "tester").unwrap();
+        storage.create_issue(&child, "tester").unwrap();
+        storage
+            .add_dependency("bd-epic.1", "bd-epic", "parent-child", "tester")
+            .unwrap();
+
+        let policy = crate::close_policy::IssueTypePolicy {
+            types: vec![crate::close_policy::IssueTypeDefinition {
+                name: "epic".to_string(),
+                capabilities: crate::close_policy::IssueTypeCapabilityOverrides {
+                    blocked_by_open_children: Some(false),
+                    ..Default::default()
+                },
+                roadmap_role: None,
+            }],
+            ..Default::default()
+        };
+        storage.set_issue_type_registry(
+            crate::close_policy::TypeCapabilityRegistry::resolve(&policy).unwrap(),
+        );
+        storage.rebuild_blocked_cache(true).unwrap();
+        assert!(storage.blocked_cache_marked_stale().unwrap());
+        assert!(!storage.is_blocked("bd-epic").unwrap());
+
+        storage.set_issue_type_registry(crate::close_policy::TypeCapabilityRegistry::default());
+        assert!(
+            storage.get_blocked_ids().unwrap().contains("bd-epic"),
+            "builtin Epic reads must recompute instead of trusting the custom projection"
         );
     }
 
@@ -26767,7 +27568,8 @@ mod tests {
             )
             .unwrap();
 
-        let rebuilt = SqliteStorage::rebuild_blocked_cache_impl(&storage.conn).unwrap();
+        let registry = crate::close_policy::TypeCapabilityRegistry::default();
+        let rebuilt = SqliteStorage::rebuild_blocked_cache_impl(&storage.conn, &registry).unwrap();
         assert_eq!(rebuilt, 1);
         assert_eq!(storage.get_blockers(&blocked.id).unwrap(), vec![blocker.id]);
     }
@@ -31236,6 +32038,7 @@ mod tests {
             pending_event_attribution: None,
             workflow_capacity_policy: crate::close_policy::CapacityPolicy::default(),
             workflow_transition_policy: crate::close_policy::Workflow::default(),
+            issue_type_registry: crate::close_policy::TypeCapabilityRegistry::default(),
             last_capacity_warnings: Vec::new(),
         };
         let timestamp = Utc.with_ymd_and_hms(2026, 3, 11, 0, 0, 0).unwrap();
@@ -31515,6 +32318,57 @@ mod tests {
         assert_eq!(
             next_for_child1, 2,
             "After bd-parent.1.1 exists, next for bd-parent.1 should be .2"
+        );
+    }
+
+    #[test]
+    fn generate_issue_id_rejects_exhausted_child_counter() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let created_at = Utc.with_ymd_and_hms(2025, 1, 1, 0, 0, 0).unwrap();
+        let parent = make_issue(
+            "bd-parent",
+            "Parent Epic",
+            Status::Open,
+            2,
+            None,
+            created_at,
+            None,
+        );
+        storage.create_issue(&parent, "tester").unwrap();
+        let final_child = make_issue(
+            "bd-parent.4294967295",
+            "Final child",
+            Status::Open,
+            2,
+            None,
+            created_at,
+            None,
+        );
+        storage.create_issue(&final_child, "tester").unwrap();
+
+        let error = storage
+            .generate_issue_id(
+                &IdConfig::default(),
+                IdGenerationInput {
+                    title: "Impossible child",
+                    description: None,
+                    creator: Some("tester"),
+                    created_at,
+                    issue_count: 2,
+                },
+                Some(&parent.id),
+                None,
+                IssueSequenceAllocation::Allocate,
+            )
+            .expect_err("the maximum child number must fail instead of looping");
+
+        assert!(
+            matches!(
+                &error,
+                BeadsError::Validation { field, reason }
+                    if field == "parent" && reason == "child ID counter exhausted"
+            ),
+            "unexpected exhausted-child error: {error:?}"
         );
     }
 
@@ -33202,6 +34056,8 @@ mod tests {
     }
 
     #[test]
+    // This fixture verifies every relation and operational side effect of one commit.
+    #[allow(clippy::too_many_lines)]
     fn sync_merge_transaction_commits_rows_relations_notes_and_operational_state_together() {
         let mut storage = SqliteStorage::open_memory().unwrap();
         let now = Utc.with_ymd_and_hms(2026, 7, 27, 7, 0, 0).unwrap();
@@ -33457,6 +34313,8 @@ mod tests {
     }
 
     #[test]
+    // Full-envelope tampering is clearest as one table-driven receipt audit.
+    #[allow(clippy::too_many_lines)]
     fn sync_merge_pending_receipt_roundtrips_and_rejects_full_envelope_tampering() {
         let mut storage = SqliteStorage::open_memory().unwrap();
         let now = Utc.with_ymd_and_hms(2026, 7, 27, 8, 0, 0).unwrap();
@@ -33538,7 +34396,7 @@ mod tests {
         let mut tampered_state_digest = receipt.clone();
         tampered_state_digest.state_sha256 = "60".repeat(32);
 
-        for (field, tampered) in [
+        for (field, tampered) in vec![
             ("schema_version", unsupported_schema),
             ("intent.schema_version", tampered_intent_schema),
             ("intent", tampered_intent),
@@ -33720,6 +34578,8 @@ mod tests {
     }
 
     #[test]
+    // Keep the complete CAS invariant matrix in one stateful receipt fixture.
+    #[allow(clippy::too_many_lines)]
     fn sync_merge_pending_receipt_cas_rejects_stale_backward_and_immutable_changes() {
         let mut storage = SqliteStorage::open_memory().unwrap();
         let now = Utc.with_ymd_and_hms(2026, 7, 27, 8, 30, 0).unwrap();
@@ -33890,6 +34750,8 @@ mod tests {
     }
 
     #[test]
+    // Keep terminal cleanup and every rejected drift case in one receipt lifecycle.
+    #[allow(clippy::too_many_lines)]
     fn sync_merge_pending_receipt_clear_requires_exact_terminal_value() {
         let mut storage = SqliteStorage::open_memory().unwrap();
         let now = Utc.with_ymd_and_hms(2026, 7, 27, 8, 45, 0).unwrap();

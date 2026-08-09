@@ -2,15 +2,15 @@
   "name": "sidecar_wal_without_shm",
   "family": "sidecar_mismatch",
   "description": "The workspace includes a stray WAL sidecar without a matching SHM sidecar or coordinated writer state.",
-  "expected_classification": "degraded",
+  "expected_classification": "recoverable",
   "expected_command_outcomes": [
     {
       "surface": "startup/open",
-      "outcome": "success"
+      "outcome": "fails_database_authority"
     },
     {
       "surface": "create",
-      "outcome": "success"
+      "outcome": "fails_database_authority"
     },
     {
       "surface": "doctor",
@@ -18,16 +18,16 @@
     },
     {
       "surface": "doctor --repair",
-      "outcome": "repair_applied"
+      "outcome": "fails_doctor_authority"
     },
     {
       "surface": "sync --status",
-      "outcome": "status_in_sync"
+      "outcome": "fails_database_authority"
     }
   ],
   "source_hint": "Represents the stale or missing sidecar family called out in beads_rust-rsei.2.1.",
   "notes": [
-    "The database file itself is healthy so future tests can isolate how startup reacts to sidecar mismatch.",
-    "The WAL payload is intentionally synthetic and small."
+    "The database file itself is healthy so the fixture isolates how database-family authority reacts to sidecar corruption.",
+    "The synthetic WAL has invalid magic, making the family uninspectable; ordinary and doctor mutations fail closed until an operator restores an inspectable family."
   ]
 }

@@ -1,5 +1,6 @@
 ---
 source: tests/snapshots/schema_output.rs
+assertion_line: 858
 expression: normalized_toon
 ---
 tool: br
@@ -11,7 +12,9 @@ schemas:
     description: Complete hash-bound result for additive reconciliation planning/apply.
     type: object
     properties:
-      schema.type: string
+      schema:
+        description: Receipt schema identifier (`br.sync.additive-reconciliation.v3`).
+        type: string
       algorithm.type: string
       tool_version.type: string
       plan_sha256.type: string
@@ -329,6 +332,10 @@ schemas:
             format: uint
             minimum: 0
           child_counter_payload_sha256.type: string
+          id_counters:
+            "$ref": #/$defs/AdditiveTableWitness
+          issue_sequences:
+            "$ref": #/$defs/AdditiveTableWitness
           config:
             "$ref": #/$defs/AdditiveTableWitness
           close_metadata:
@@ -345,7 +352,7 @@ schemas:
           stored_jsonl_mtime.type[2]: string,"null"
           stored_jsonl_size.type[2]: string,"null"
           needs_flush.type[2]: string,"null"
-        required[28]: issues,issue_payload_sha256,issue_semantic_payload_sha256,issue_content_hashes,issue_content_hash_payload_sha256,relations,label_payload_sha256,dependency_payload_sha256,comment_payload_sha256,export_hashes,export_hash_payload_sha256,events,event_payload_sha256,dirty_issues,dirty_payload_sha256,metadata_rows,metadata_payload_sha256,stable_metadata,blocked_cache_entries,blocked_cache_payload_sha256,child_counter_entries,child_counter_payload_sha256,config,close_metadata,gate_results,gate_result_history,schema_catalog,sqlite_sequence
+        required[30]: issues,issue_payload_sha256,issue_semantic_payload_sha256,issue_content_hashes,issue_content_hash_payload_sha256,relations,label_payload_sha256,dependency_payload_sha256,comment_payload_sha256,export_hashes,export_hash_payload_sha256,events,event_payload_sha256,dirty_issues,dirty_payload_sha256,metadata_rows,metadata_payload_sha256,stable_metadata,blocked_cache_entries,blocked_cache_payload_sha256,child_counter_entries,child_counter_payload_sha256,id_counters,issue_sequences,config,close_metadata,gate_results,gate_result_history,schema_catalog,sqlite_sequence
       AdditiveRelationCounts:
         description: Relation-row counts captured around additive reconciliation.
         type: object
@@ -1391,7 +1398,7 @@ schemas:
         description: Dependency relationship type.
         anyOf[2]:
           - type: string
-            enum[11]: blocks,parent-child,conditional-blocks,waits-for,related,discovered-from,replies-to,relates-to,duplicates,supersedes,caused-by
+            enum[13]: blocks,parent-child,conditional-blocks,waits-for,related,derived-from,implements,discovered-from,replies-to,relates-to,duplicates,supersedes,caused-by
           - type: string
       Comment:
         description: A comment on an issue.
@@ -1592,7 +1599,7 @@ schemas:
         description: Dependency relationship type.
         anyOf[2]:
           - type: string
-            enum[11]: blocks,parent-child,conditional-blocks,waits-for,related,discovered-from,replies-to,relates-to,duplicates,supersedes,caused-by
+            enum[13]: blocks,parent-child,conditional-blocks,waits-for,related,derived-from,implements,discovered-from,replies-to,relates-to,duplicates,supersedes,caused-by
           - type: string
       Comment:
         description: A comment on an issue.
@@ -1841,7 +1848,7 @@ schemas:
         description: Dependency relationship type.
         anyOf[2]:
           - type: string
-            enum[11]: blocks,parent-child,conditional-blocks,waits-for,related,discovered-from,replies-to,relates-to,duplicates,supersedes,caused-by
+            enum[13]: blocks,parent-child,conditional-blocks,waits-for,related,derived-from,implements,discovered-from,replies-to,relates-to,duplicates,supersedes,caused-by
           - type: string
       Comment:
         description: A comment on an issue.
@@ -1908,6 +1915,225 @@ schemas:
           - type: string
             enum[8]: open,in_progress,blocked,deferred,draft,closed,tombstone,pinned
           - type: string
+  RedirectReceipt:
+    "$schema": "https://json-schema.org/draft/2020-12/schema"
+    title: RedirectReceipt
+    description: Durable result of a redirect setup request.
+    type: object
+    properties:
+      schema:
+        description: Machine-contract identifier.
+        type: string
+      source_workspace:
+        description: Local workspace that owns the redirect file.
+        type: string
+      requested_target:
+        description: "Exact target supplied by the operator, or null for automatic discovery."
+        type[2]: string,"null"
+      target_mode:
+        description: Whether the target was explicit or discovered from Git metadata.
+        "$ref": #/$defs/RedirectTargetMode
+      final_target:
+        description: Terminal canonical workspace after following redirect chains.
+        type: string
+      redirect_path:
+        description: Local redirect file that was created or inspected.
+        type: string
+      disposition:
+        description: "`created`, `unchanged`, `primary_owner`, or `refused`."
+        "$ref": #/$defs/RedirectDisposition
+      changed:
+        description: Whether this invocation created the redirect.
+        type: boolean
+      primary_worktree:
+        description: Whether the caller already owns the terminal canonical workspace.
+        type: boolean
+      existing_state_acknowledged:
+        description: Whether material local state was explicitly acknowledged.
+        type: boolean
+      dormant_artifacts:
+        description: Preserved local artifacts that become dormant behind the redirect.
+        type: array
+        items.type: string
+    required[11]: schema,source_workspace,requested_target,target_mode,final_target,redirect_path,disposition,changed,primary_worktree,existing_state_acknowledged,dormant_artifacts
+    "$defs":
+      RedirectTargetMode:
+        description: How a redirect target was selected.
+        oneOf[2]{description,type,const}:
+          The operator supplied the exact beads directory.,string,explicit
+          The primary worktree was discovered from Git administrative metadata.,string,automatic
+      RedirectDisposition:
+        description: Observable redirect setup outcome.
+        oneOf[4]{description,type,const}:
+          A new redirect was published.,string,created
+          An existing redirect already selected the requested authority.,string,unchanged
+          The local workspace is itself the selected authority.,string,primary_owner
+          Setup was refused without changing local routing.,string,refused
+  Roadmap:
+    "$schema": "https://json-schema.org/draft/2020-12/schema"
+    title: RoadmapOutput
+    type: object
+    properties:
+      contract_version.type: string
+      requested_root:
+        "$ref": #/$defs/RequestedRoot
+      roots:
+        type: array
+        items.type: string
+      nodes:
+        type: array
+        items:
+          "$ref": #/$defs/RoadmapNode
+      edges:
+        type: array
+        items:
+          "$ref": #/$defs/RoadmapEdge
+      placements:
+        type: array
+        items:
+          "$ref": #/$defs/RoadmapPlacement
+      filters:
+        "$ref": #/$defs/RoadmapFilters
+      truncation:
+        "$ref": #/$defs/RoadmapTruncation
+      summaries:
+        type: array
+        items:
+          "$ref": #/$defs/RoadmapSummary
+      diagnostics:
+        type: array
+        items:
+          "$ref": #/$defs/RoadmapDiagnostic
+    required[10]: contract_version,requested_root,roots,nodes,edges,placements,filters,truncation,summaries,diagnostics
+    "$defs":
+      RequestedRoot:
+        type: object
+        properties:
+          id.type: string
+          marked.type: boolean
+        required[2]: id,marked
+      RoadmapNode:
+        type: object
+        properties:
+          id.type: string
+          title.type: string
+          issue_type.type: string
+          status.type: string
+          priority:
+            type: integer
+            format: int32
+          is_template.type: boolean
+          missing.type: boolean
+          roadmap_role.anyOf[2]:
+            - "$ref": #/$defs/RoadmapRole
+            - type: "null"
+        required[7]: id,title,issue_type,status,priority,is_template,missing
+      RoadmapRole:
+        description: Presentation classification for workflow roadmap views.
+        type: string
+        enum[4]: authority,decision,specification,implementation
+      RoadmapEdge:
+        type: object
+        properties:
+          from.type: string
+          to.type: string
+          relation.type: string
+        required[3]: from,to,relation
+      RoadmapPlacement:
+        type: object
+        properties:
+          id.type: string
+          parent_id.type[2]: string,"null"
+          relation.type[2]: string,"null"
+          depth:
+            type: integer
+            format: uint
+            minimum: 0
+          requested.type: boolean
+          reference.type: boolean
+          truncated.type: boolean
+          requested_route:
+            description: This truncated placement is on an upstream path to the requested issue.
+            type: boolean
+          hidden_count:
+            type: integer
+            format: uint
+            minimum: 0
+        required[7]: id,depth,requested,reference,truncated,requested_route,hidden_count
+      RoadmapFilters:
+        type: object
+        properties:
+          focus:
+            type: array
+            items.type: string
+          path_compression.type: boolean
+        required[2]: focus,path_compression
+      RoadmapTruncation:
+        type: object
+        properties:
+          max_depth:
+            type[2]: integer,"null"
+            format: uint
+            minimum: 0
+          truncated_placements:
+            type: integer
+            format: uint
+            minimum: 0
+          requested_hidden.type: boolean
+        required[3]: max_depth,truncated_placements,requested_hidden
+      RoadmapSummary:
+        type: object
+        properties:
+          id.type: string
+          title.type: string
+          scope.type: string
+          rows:
+            type: array
+            items:
+              "$ref": #/$defs/RoadmapSummaryRow
+          total:
+            "$ref": #/$defs/RoadmapProgress
+        required[5]: id,title,scope,rows,total
+      RoadmapSummaryRow:
+        type: object
+        properties:
+          issue_type.type: string
+          count:
+            type: integer
+            format: uint
+            minimum: 0
+          terminal:
+            type: integer
+            format: uint
+            minimum: 0
+          completion_percent:
+            type[2]: integer,"null"
+            format: uint
+            minimum: 0
+        required[4]: issue_type,count,terminal,completion_percent
+      RoadmapProgress:
+        type: object
+        properties:
+          count:
+            type: integer
+            format: uint
+            minimum: 0
+          terminal:
+            type: integer
+            format: uint
+            minimum: 0
+          completion_percent:
+            type[2]: integer,"null"
+            format: uint
+            minimum: 0
+        required[3]: count,terminal,completion_percent
+      RoadmapDiagnostic:
+        type: object
+        properties:
+          code.type: string
+          message.type: string
+          issue_id.type[2]: string,"null"
+        required[2]: code,message
   StaleIssue:
     "$schema": "https://json-schema.org/draft/2020-12/schema"
     title: StaleIssue
@@ -2368,6 +2594,56 @@ schemas:
         description: True when the node has children omitted by `--max-depth`.
         type: boolean
     required[7]: id,title,depth,parent_id,priority,status,truncated
+  TypeCapabilityRegistry:
+    "$schema": "https://json-schema.org/draft/2020-12/schema"
+    title: TypeCapabilityRegistry
+    description: Accepted issue-type syntax plus the resolved capability-registration map.
+    type: object
+    properties:
+      standard_types:
+        description: "Canonical standard names accepted as issue-type syntax.\n\nThis is not an allowlist: custom names may also be accepted."
+        type: array
+        items.type: string
+      accepts_custom_types:
+        description: Whether unregistered custom issue-type strings are accepted.
+        type: boolean
+      active_profiles:
+        description: Enabled profiles contributing capability registrations.
+        type: array
+        items.type: string
+      types:
+        description: "Effective behavior-bearing registrations, keyed by normalized name.\n\nOmission from this map means neutral capabilities, not invalid syntax."
+        type: object
+        additionalProperties:
+          "$ref": #/$defs/EffectiveIssueType
+    required[4]: standard_types,accepts_custom_types,active_profiles,types
+    "$defs":
+      EffectiveIssueType:
+        description: One effective registered type exposed through machine-readable contracts.
+        type: object
+        properties:
+          name.type: string
+          source.type: string
+          capabilities:
+            "$ref": #/$defs/IssueTypeCapabilities
+          roadmap_role.anyOf[2]:
+            - "$ref": #/$defs/RoadmapRole
+            - type: "null"
+        required[3]: name,source,capabilities
+      IssueTypeCapabilities:
+        description: Effective behavior for one normalized issue type.
+        type: object
+        properties:
+          aggregate.type: boolean
+          ready_work.type: boolean
+          blocked_by_open_children.type: boolean
+          may_close_with_open_children.type: boolean
+          inherited_context_root.type: boolean
+        required[5]: aggregate,ready_work,blocked_by_open_children,may_close_with_open_children,inherited_context_root
+      RoadmapRole:
+        description: Presentation classification for workflow roadmap views.
+        type: string
+        enum[4]: authority,decision,specification,implementation
   VcsExportStatus:
     "$schema": "https://json-schema.org/draft/2020-12/schema"
     title: VcsExportStatus
@@ -2456,7 +2732,7 @@ commands:
     shape: object
     jq_filter: .
     error_envelope_on_stderr: false
-    notes: "Machine-readable command, feature, safety, exit-code, and env-var inventory."
+    notes: "Machine-readable command, feature, safety, exit-code, env-var, and effective issue-type inventory. The issue_types field conforms to TypeCapabilityRegistry, separating accepted standard/custom syntax from behavior-bearing registrations."
   "comments list":
     shape: array
     jq_filter: ".[]"
@@ -2499,6 +2775,12 @@ commands:
     jq_filter: .
     error_envelope_on_stderr: false
     notes: "Workspace info object (paths, mode, config snapshot)."
+  "init --redirect":
+    shape: object
+    jq_filter: .
+    item_schema: RedirectReceipt
+    error_envelope_on_stderr: false
+    notes: "Stable br.redirect.v1 receipt. Setup validates through a target snapshot, never mutates the canonical target, and reports created, unchanged, primary_owner, or refused."
   "label list":
     shape: array
     jq_filter: ".[]"
@@ -2517,6 +2799,18 @@ commands:
     items_at: .
     item_schema: ReadyIssue
     error_envelope_on_stderr: false
+  "redirect set":
+    shape: object
+    jq_filter: .
+    item_schema: RedirectReceipt
+    error_envelope_on_stderr: false
+    notes: "Stable br.redirect.v1 receipt. Setup validates through a target snapshot, never mutates the canonical target, and reports created, unchanged, primary_owner, or refused."
+  roadmap:
+    shape: object
+    jq_filter: .
+    item_schema: Roadmap
+    error_envelope_on_stderr: false
+    notes: Workflow-generic containment and traceability envelope; execution edges are excluded.
   "robot-docs guide":
     shape: object
     jq_filter: .

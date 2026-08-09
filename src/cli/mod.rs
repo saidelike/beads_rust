@@ -112,16 +112,6 @@ const STATUS_WITH_ALL_CANDIDATES: &[(&str, &str)] = &[
     ("pinned", "Pinned"),
 ];
 
-const ISSUE_TYPE_CANDIDATES: &[(&str, &str)] = &[
-    ("task", "Task"),
-    ("bug", "Bug"),
-    ("feature", "Feature"),
-    ("epic", "Epic"),
-    ("chore", "Chore"),
-    ("docs", "Docs"),
-    ("question", "Question"),
-];
-
 const PRIORITY_CANDIDATES: &[(&str, &str)] = &[
     ("0", "Critical (P0)"),
     ("1", "High (P1)"),
@@ -149,6 +139,8 @@ const DEP_TYPE_CANDIDATES: &[(&str, &str)] = &[
     ("conditional-blocks", "Conditional blocks"),
     ("waits-for", "Waits for"),
     ("related", "Related"),
+    ("derived-from", "Derived from"),
+    ("implements", "Implements"),
     ("discovered-from", "Discovered from"),
     ("replies-to", "Replies to"),
     ("relates-to", "Relates to"),
@@ -509,13 +501,27 @@ fn status_or_all_completer(current: &OsStr) -> Vec<CompletionCandidate> {
 }
 
 fn issue_type_is_standard(value: &str) -> bool {
-    ISSUE_TYPE_CANDIDATES
+    IssueType::STANDARD_NAMES
         .iter()
-        .any(|(candidate, _)| candidate.eq_ignore_ascii_case(value))
+        .any(|candidate| candidate.eq_ignore_ascii_case(value))
+}
+
+fn standard_issue_type_candidates(prefix: &str) -> Vec<CompletionCandidate> {
+    IssueType::STANDARD_NAMES
+        .iter()
+        .filter(|candidate| matches_prefix_case_insensitive(candidate, prefix))
+        .map(|candidate| {
+            let mut chars = candidate.chars();
+            let label = chars.next().map_or_else(String::new, |first| {
+                first.to_uppercase().chain(chars).collect()
+            });
+            CompletionCandidate::new(*candidate).help(Some(StyledStr::from(label)))
+        })
+        .collect()
 }
 
 fn issue_type_candidates(prefix: &str) -> Vec<CompletionCandidate> {
-    let mut candidates = static_candidates(prefix, ISSUE_TYPE_CANDIDATES);
+    let mut candidates = standard_issue_type_candidates(prefix);
     candidates.extend(
         completion_index()
             .types
@@ -550,7 +556,7 @@ fn issue_type_standard_completer(current: &OsStr) -> Vec<CompletionCandidate> {
     let Some(prefix) = current.to_str() else {
         return Vec::new();
     };
-    static_candidates(prefix, ISSUE_TYPE_CANDIDATES)
+    standard_issue_type_candidates(prefix)
 }
 
 fn priority_completer(current: &OsStr) -> Vec<CompletionCandidate> {
@@ -821,6 +827,9 @@ pub enum Commands {
         command: EpicCommands,
     },
 
+    /// Show containment and traceability as one workflow roadmap
+    Roadmap(RoadmapArgs),
+
     /// Workflow gate engine: record and inspect gate results (issue #312)
     Gate {
         #[command(subcommand)]
@@ -849,6 +858,15 @@ pub enum Commands {
         /// Backend type (ignored, always sqlite)
         #[arg(long)]
         backend: Option<String>,
+
+        /// Route this worktree to an existing .beads workspace
+        #[arg(
+            long,
+            value_name = "BEADS_DIR",
+            num_args = 0..=1,
+            conflicts_with_all = ["prefix", "force", "backend"]
+        )]
+        redirect: Option<Option<PathBuf>>,
     },
 
     /// Manage labels
@@ -877,6 +895,12 @@ pub enum Commands {
 
     /// List ready issues (open, unblocked, not deferred)
     Ready(ReadyArgs),
+
+    /// Manage worktree workspace redirects
+    Redirect {
+        #[command(subcommand)]
+        command: RedirectCommands,
+    },
 
     /// Reopen an issue
     Reopen(ReopenArgs),
@@ -1001,6 +1025,25 @@ EXAMPLES:
 
     /// Show the active .beads directory
     Where,
+}
+
+/// Worktree redirect management commands.
+#[derive(Subcommand, Debug)]
+pub enum RedirectCommands {
+    /// Route this worktree to an existing canonical beads workspace
+    Set(RedirectSetArgs),
+}
+
+/// Arguments for `br redirect set`.
+#[derive(Args, Debug)]
+pub struct RedirectSetArgs {
+    /// Exact .beads target; omit to discover the primary Git worktree
+    #[arg(value_name = "BEADS_DIR")]
+    pub target: Option<PathBuf>,
+
+    /// Acknowledge that material local tracker state will become dormant
+    #[arg(long)]
+    pub allow_existing: bool,
 }
 
 /// Arguments for the completions command.
@@ -1513,14 +1556,20 @@ pub enum SchemaTarget {
     BlockedIssue,
     /// Dependency tree node
     TreeNode,
+    /// Composite containment and traceability roadmap envelope
+    Roadmap,
     /// Stats output
     Statistics,
     /// Coordination status output
     CoordinationStatus,
+    /// Issue-type acceptance and capability registrations
+    IssueTypeCapabilities,
     /// Additive reconciliation plan/apply receipt
     AdditiveReconciliation,
     /// Explicit VCS export-status diagnostic
     VcsStatus,
+    /// Worktree redirect setup receipt
+    RedirectReceipt,
     /// Structured error envelope (stderr JSON when robot mode or non-TTY)
     Error,
     /// Per-command JSON output envelope map (top-level shape + jq filter per command)
@@ -1616,6 +1665,34 @@ pub enum OutputFormatBasic {
     Json,
     /// TOON format (token-optimized object notation)
     Toon,
+}
+
+/// Output format for the composite roadmap workflow view.
+#[derive(ValueEnum, Debug, Clone, Copy, Default, Eq, PartialEq)]
+pub enum RoadmapOutputFormat {
+    /// Human-readable text (default)
+    #[default]
+    Text,
+    /// Versioned machine-readable JSON
+    Json,
+    /// Mermaid flowchart
+    Mermaid,
+    /// Graphviz DOT graph
+    Dot,
+}
+
+/// Role-aware roadmap focus.
+#[derive(ValueEnum, Debug, Clone, Copy, Eq, PartialEq)]
+pub enum RoadmapFocus {
+    Decisions,
+    Implementations,
+}
+
+/// Section selection for the composite roadmap workflow view.
+#[derive(ValueEnum, Debug, Clone, Copy, Eq, PartialEq)]
+pub enum RoadmapSection {
+    Graph,
+    Summary,
 }
 
 impl From<OutputFormatBasic> for OutputFormat {
@@ -1953,6 +2030,42 @@ pub struct EpicCloseEligibleArgs {
     pub transition_comment: Option<String>,
 }
 
+/// Arguments for the composite roadmap workflow view.
+#[derive(Args, Debug, Clone)]
+pub struct RoadmapArgs {
+    /// Requested issue (full ID or unambiguous prefix)
+    #[arg(add = ArgValueCompleter::new(issue_id_completer))]
+    pub root: String,
+
+    /// Maximum displayed mixed-relation depth; roots are depth zero
+    #[arg(long)]
+    pub max_depth: Option<usize>,
+
+    /// Comma-separated sibling sort keys: priority,status,title,id
+    #[arg(
+        long,
+        default_value = "priority,status,title,id",
+        allow_hyphen_values = true
+    )]
+    pub sort: String,
+
+    /// Soft-wrap long human-readable node labels
+    #[arg(long)]
+    pub wrap: bool,
+
+    /// Focus by roadmap role; accepts repeated and comma-separated values
+    #[arg(long, value_enum, value_delimiter = ',', num_args = 1..)]
+    pub focus: Vec<RoadmapFocus>,
+
+    /// Render only the graph or only the summaries; omitted renders both
+    #[arg(long, value_enum)]
+    pub only: Option<RoadmapSection>,
+
+    /// Output format: text, json, mermaid, or dot
+    #[arg(long, value_enum)]
+    pub format: Option<RoadmapOutputFormat>,
+}
+
 /// Subcommands for the workflow gate engine (issue #312, layer 2).
 #[derive(Subcommand, Debug)]
 pub enum GateCommands {
@@ -2177,6 +2290,10 @@ pub struct DepRemoveArgs {
     /// Target issue ID to remove dependency to
     #[arg(add = ArgValueCompleter::new(issue_id_completer))]
     pub depends_on: String,
+
+    /// Remove only this relation type; required when the pair has multiple relations
+    #[arg(long = "type", short = 't', add = ArgValueCompleter::new(dep_type_completer))]
+    pub dep_type: Option<String>,
 }
 
 #[derive(Args, Debug)]
@@ -3601,6 +3718,7 @@ mod tests {
         issue_type_completer_delimited, resolve_output_format_basic_with_outer_mode,
         resolve_output_format_with_outer_mode,
     };
+    use crate::model::IssueType;
     use crate::storage::sqlite::SqliteStorage;
     use clap::{CommandFactory, Parser};
     use clap_complete::engine::CompletionCandidate;
@@ -3756,6 +3874,12 @@ mod tests {
 
         assert_eq!(plain.first().map(String::as_str), Some("bug"));
         assert_eq!(delimited, expected);
+    }
+
+    #[test]
+    fn standard_issue_type_completion_uses_canonical_model_order() {
+        let values = candidate_values(super::issue_type_standard_completer(OsStr::new("")));
+        assert_eq!(values, IssueType::STANDARD_NAMES.map(str::to_string));
     }
 
     #[test]

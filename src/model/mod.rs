@@ -8,6 +8,7 @@
 //! - `Comment` - Issue comments
 //! - `Event` - Audit log entries
 
+use crate::util::id::IssueSequenceNumber;
 use chrono::{DateTime, Utc};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize, Serializer};
@@ -215,6 +216,17 @@ impl<'de> Deserialize<'de> for IssueType {
 }
 
 impl IssueType {
+    /// Canonical standard issue-type names accepted by the parser.
+    ///
+    /// This list describes familiar syntax, not the smaller set of types with
+    /// explicit capability registrations.
+    pub const STANDARD_NAMES: [&str; 7] = [
+        "task", "bug", "feature", "epic", "chore", "docs", "question",
+    ];
+
+    /// The parser accepts normalized, unregistered issue-type strings.
+    pub const ACCEPTS_CUSTOM_TYPES: bool = true;
+
     fn known_value(value: &str) -> Option<Self> {
         Some(match value.to_lowercase().as_str() {
             "task" => Self::Task,
@@ -273,6 +285,8 @@ pub enum DependencyType {
     ConditionalBlocks,
     WaitsFor,
     Related,
+    DerivedFrom,
+    Implements,
     DiscoveredFrom,
     RepliesTo,
     RelatesTo,
@@ -293,6 +307,8 @@ impl<'de> Deserialize<'de> for DependencyType {
             "conditional-blocks" => Self::ConditionalBlocks,
             "waits-for" => Self::WaitsFor,
             "related" => Self::Related,
+            "derived-from" => Self::DerivedFrom,
+            "implements" => Self::Implements,
             "discovered-from" => Self::DiscoveredFrom,
             "replies-to" => Self::RepliesTo,
             "relates-to" => Self::RelatesTo,
@@ -313,6 +329,8 @@ impl DependencyType {
             Self::ConditionalBlocks => "conditional-blocks",
             Self::WaitsFor => "waits-for",
             Self::Related => "related",
+            Self::DerivedFrom => "derived-from",
+            Self::Implements => "implements",
             Self::DiscoveredFrom => "discovered-from",
             Self::RepliesTo => "replies-to",
             Self::RelatesTo => "relates-to",
@@ -356,6 +374,8 @@ impl FromStr for DependencyType {
             "conditional-blocks" => Ok(Self::ConditionalBlocks),
             "waits-for" => Ok(Self::WaitsFor),
             "related" => Ok(Self::Related),
+            "derived-from" => Ok(Self::DerivedFrom),
+            "implements" => Ok(Self::Implements),
             "discovered-from" => Ok(Self::DiscoveredFrom),
             "replies-to" => Ok(Self::RepliesTo),
             "relates-to" => Ok(Self::RelatesTo),
@@ -625,6 +645,27 @@ pub struct Issue {
     pub dependencies: Vec<Dependency>,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub comments: Vec<Comment>,
+}
+
+/// Serialized issue record with optional human-facing sequence metadata.
+///
+/// The issue ID remains the primary identity. `sequence_number` is an
+/// optional repository-local shorthand carried through SQLite and JSONL.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct IssueRecord {
+    #[serde(flatten)]
+    pub issue: Issue,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sequence_number: Option<IssueSequenceNumber>,
+}
+
+/// Borrowed form of [`IssueRecord`] used by JSONL export.
+#[derive(Debug, Serialize)]
+pub struct IssueRecordRef<'a> {
+    #[serde(flatten)]
+    pub issue: &'a Issue,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sequence_number: Option<IssueSequenceNumber>,
 }
 
 impl Default for Issue {
@@ -1056,6 +1097,37 @@ mod tests {
     }
 
     #[test]
+    fn issue_record_roundtrips_optional_sequence_number() {
+        let record = IssueRecord {
+            issue: Issue {
+                id: "001-model-record-abc".to_string(),
+                title: "Model record".to_string(),
+                ..Issue::default()
+            },
+            sequence_number: Some(IssueSequenceNumber::new(1).unwrap()),
+        };
+
+        let json = serde_json::to_string(&record).expect("serialize issue record");
+        assert!(json.contains("\"sequence_number\":1"));
+        let decoded: IssueRecord = serde_json::from_str(&json).expect("deserialize issue record");
+        assert_eq!(decoded.issue.id, record.issue.id);
+        assert_eq!(decoded.issue.title, record.issue.title);
+        assert_eq!(decoded.sequence_number, record.sequence_number);
+    }
+
+    #[test]
+    fn issue_record_rejects_non_positive_sequence_numbers() {
+        for value in [0, -1] {
+            let json = format!(
+                r#"{{"id":"bad-sequence","title":"Bad sequence","sequence_number":{value}}}"#
+            );
+            let error = serde_json::from_str::<IssueRecord>(&json)
+                .expect_err("non-positive sequence must fail deserialization");
+            assert!(error.to_string().contains("expected positive integer"));
+        }
+    }
+
+    #[test]
     fn test_priority_serialization() {
         let p = Priority::CRITICAL;
         let json = serde_json::to_string(&p).unwrap();
@@ -1274,18 +1346,23 @@ mod tests {
 
     #[test]
     fn test_issue_type_from_str_all_variants() {
-        // Only these 5 types are valid via FromStr for bd conformance
-        assert_eq!(IssueType::from_str("task").unwrap(), IssueType::Task);
-        assert_eq!(IssueType::from_str("bug").unwrap(), IssueType::Bug);
-        assert_eq!(IssueType::from_str("feature").unwrap(), IssueType::Feature);
-        assert_eq!(IssueType::from_str("epic").unwrap(), IssueType::Epic);
-        assert_eq!(IssueType::from_str("chore").unwrap(), IssueType::Chore);
-        // docs and question are now accepted
-        assert_eq!(IssueType::from_str("docs").unwrap(), IssueType::Docs);
-        assert_eq!(
-            IssueType::from_str("question").unwrap(),
-            IssueType::Question
-        );
+        let expected = [
+            IssueType::Task,
+            IssueType::Bug,
+            IssueType::Feature,
+            IssueType::Epic,
+            IssueType::Chore,
+            IssueType::Docs,
+            IssueType::Question,
+        ];
+
+        for (name, expected) in IssueType::STANDARD_NAMES.into_iter().zip(expected) {
+            let parsed = IssueType::from_str(name).expect("standard issue type parses");
+            assert_eq!(parsed, expected);
+            assert_eq!(parsed.as_str(), name);
+            assert_eq!(parsed.to_string(), name);
+            assert!(parsed.is_standard());
+        }
     }
 
     #[test]
@@ -1372,6 +1449,14 @@ mod tests {
             DependencyType::DiscoveredFrom
         );
         assert_eq!(
+            DependencyType::from_str("derived-from").unwrap(),
+            DependencyType::DerivedFrom
+        );
+        assert_eq!(
+            DependencyType::from_str("implements").unwrap(),
+            DependencyType::Implements
+        );
+        assert_eq!(
             DependencyType::from_str("replies-to").unwrap(),
             DependencyType::RepliesTo
         );
@@ -1412,6 +1497,8 @@ mod tests {
         assert!(DependencyType::ConditionalBlocks.is_blocking());
         assert!(DependencyType::WaitsFor.is_blocking());
         assert!(!DependencyType::Related.is_blocking());
+        assert!(!DependencyType::DerivedFrom.is_blocking());
+        assert!(!DependencyType::Implements.is_blocking());
         assert!(!DependencyType::DiscoveredFrom.is_blocking());
         assert!(!DependencyType::RepliesTo.is_blocking());
         assert!(!DependencyType::RelatesTo.is_blocking());
@@ -1428,6 +1515,8 @@ mod tests {
         assert!(DependencyType::ConditionalBlocks.affects_ready_work());
         assert!(DependencyType::WaitsFor.affects_ready_work());
         assert!(!DependencyType::Related.affects_ready_work());
+        assert!(!DependencyType::DerivedFrom.affects_ready_work());
+        assert!(!DependencyType::Implements.affects_ready_work());
         assert!(!DependencyType::DiscoveredFrom.affects_ready_work());
         assert!(!DependencyType::RepliesTo.affects_ready_work());
         assert!(!DependencyType::RelatesTo.affects_ready_work());
@@ -1447,6 +1536,8 @@ mod tests {
         );
         assert_eq!(DependencyType::WaitsFor.to_string(), "waits-for");
         assert_eq!(DependencyType::Related.to_string(), "related");
+        assert_eq!(DependencyType::DerivedFrom.to_string(), "derived-from");
+        assert_eq!(DependencyType::Implements.to_string(), "implements");
         assert_eq!(
             DependencyType::DiscoveredFrom.to_string(),
             "discovered-from"

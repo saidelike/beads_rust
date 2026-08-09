@@ -662,7 +662,7 @@ fn test_markdown_import_dependency_bullets_do_not_create_marker_dependency() {
 }
 
 #[test]
-fn test_markdown_import_invalid_dependency_warns() {
+fn test_markdown_import_unresolved_dependency_warns_and_exits_nonzero() {
     let workspace = BrWorkspace::new();
 
     let output = run_br(&workspace, ["init"], "init_invalid_dep");
@@ -681,8 +681,10 @@ invalid-type:bd-123
         "create_bad_dep",
     );
     assert!(
-        output.status.success(),
-        "create should succeed with warnings"
+        !output.status.success(),
+        "a dropped declared dependency must make the command fail\nstdout:\n{}\nstderr:\n{}",
+        output.stdout,
+        output.stderr
     );
     assert!(
         output
@@ -719,10 +721,14 @@ fn test_markdown_import_all_failed_returns_error() {
         !output.status.success(),
         "all-failed markdown import should return an error"
     );
+    let error: Value = serde_json::from_str(&extract_json_payload(&output.stdout))
+        .expect("structured JSON error output");
+    assert_eq!(error["error"]["code"], "NOTHING_TO_DO");
     assert!(
-        output.stderr.contains("failed to create any issues from"),
-        "expected summary failure, got: {}",
-        output.stderr
+        error["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("failed to create any issues from issues.md")),
+        "expected summary failure, got: {error}"
     );
 
     let list = run_br(

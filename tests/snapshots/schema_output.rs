@@ -26,10 +26,13 @@ const EXPECTED_SCHEMA_NAMES: &[&str] = &[
     "IssueDetails",
     "IssueWithCounts",
     "ReadyIssue",
+    "Roadmap",
+    "RedirectReceipt",
     "StaleIssue",
     "Statistics",
     "SyncReconcileReceipt",
     "TreeNode",
+    "TypeCapabilityRegistry",
     "VcsExportStatus",
 ];
 

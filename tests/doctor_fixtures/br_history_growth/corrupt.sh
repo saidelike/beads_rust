@@ -11,7 +11,7 @@ mkdir -p "$target_dir"
 cd "$target_dir"
 
 "$tool_bin" init >/dev/null 2>&1
-"$tool_bin" sync --flush-only >/dev/null 2>&1
+"$tool_bin" sync --flush-only --force >/dev/null 2>&1
 
 # Avoid unrelated .doctor/.gitignore repair noise when --repair creates a run
 # directory.

@@ -42,6 +42,7 @@ use common::artifact_validator::{
     PerfEvidenceTiming, StartupMatrixAggregation, StartupMatrixManifest, StartupMatrixState,
 };
 use common::binary_discovery::{DiscoveredBinaries, discover_binaries};
+use common::cli::isolated_temp_root;
 use common::dataset_registry::{IsolatedDataset, KnownDataset};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -272,7 +273,7 @@ fn measure_cold_warm(
 
 /// Create a fresh workspace with br initialized and populated.
 fn create_br_workspace(br_path: &Path, issue_count: usize) -> std::io::Result<(TempDir, PathBuf)> {
-    let temp_dir = TempDir::new()?;
+    let temp_dir = TempDir::new_in(isolated_temp_root())?;
     let root = temp_dir.path().to_path_buf();
 
     // Create minimal git scaffold
@@ -314,7 +315,7 @@ fn create_br_workspace(br_path: &Path, issue_count: usize) -> std::io::Result<(T
 
 /// Copy a br workspace for bd usage (same JSONL, fresh DB).
 fn copy_workspace_for_bd(br_root: &Path, bd_path: &Path) -> std::io::Result<(TempDir, PathBuf)> {
-    let temp_dir = TempDir::new()?;
+    let temp_dir = TempDir::new_in(isolated_temp_root())?;
     let root = temp_dir.path().to_path_buf();
 
     // Copy entire directory structure
@@ -542,7 +543,7 @@ fn write_startup_matrix_smoke_bundle(
     for &state in STARTUP_MATRIX_STATES {
         let (_workspace_guard, workspace_root) = prepare_startup_matrix_workspace(br_path, state)?;
         let routed_cwd = if state == "routed" {
-            Some(TempDir::new()?)
+            Some(TempDir::new_in(isolated_temp_root())?)
         } else {
             None
         };

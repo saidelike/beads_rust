@@ -8,8 +8,9 @@
 
 mod common;
 
-use beads_rust::model::{DependencyType, EventType, Status};
+use beads_rust::model::{Dependency, DependencyType, EventType, Status};
 use beads_rust::storage::{ReadyFilters, ReadySortPolicy, SqliteStorage};
+use chrono::Utc;
 #[allow(unused_imports)]
 use common::ordering::{
     assert_contains_exactly_one, assert_hybrid_ordered, assert_no_duplicate_ids,
@@ -24,6 +25,18 @@ fn blocked_ids_for(storage: &SqliteStorage) -> Vec<String> {
         .into_iter()
         .map(|(issue, _)| issue.id)
         .collect()
+}
+
+fn imported_dependency(issue_id: &str, depends_on_id: &str) -> Dependency {
+    Dependency {
+        issue_id: issue_id.to_string(),
+        depends_on_id: depends_on_id.to_string(),
+        dep_type: DependencyType::Blocks,
+        created_at: Utc::now(),
+        created_by: Some("tester".to_string()),
+        metadata: None,
+        thread_id: None,
+    }
 }
 
 // ============================================================================
@@ -90,6 +103,60 @@ fn add_dependency_duplicate_returns_false() {
     // Should still only have one dependency
     let deps = storage.get_dependencies(&blocked.id).unwrap();
     assert_eq!(deps.len(), 1);
+}
+
+#[test]
+fn create_and_import_preserve_parallel_typed_dependencies() {
+    let mut storage = test_db();
+    let target = fixtures::issue("typed-target");
+    storage.create_issue(&target, "tester").unwrap();
+
+    let dependency = |source: &str, dep_type| Dependency {
+        issue_id: source.to_string(),
+        depends_on_id: target.id.clone(),
+        dep_type,
+        created_at: Utc::now(),
+        created_by: Some("tester".to_string()),
+        metadata: Some("{}".to_string()),
+        thread_id: None,
+    };
+
+    let mut created = fixtures::issue("typed-created");
+    created.dependencies = vec![
+        dependency(&created.id, DependencyType::Blocks),
+        dependency(&created.id, DependencyType::Implements),
+    ];
+    storage.create_issue(&created, "tester").unwrap();
+    let created_types: Vec<DependencyType> = storage
+        .get_dependencies_full(&created.id)
+        .unwrap()
+        .into_iter()
+        .map(|dep| dep.dep_type)
+        .collect();
+    assert_eq!(created_types.len(), 2);
+    assert!(created_types.contains(&DependencyType::Blocks));
+    assert!(created_types.contains(&DependencyType::Implements));
+
+    let imported = fixtures::issue("typed-imported");
+    storage.create_issue(&imported, "tester").unwrap();
+    storage
+        .sync_dependencies_for_import(
+            &imported.id,
+            &[
+                dependency(&imported.id, DependencyType::Blocks),
+                dependency(&imported.id, DependencyType::Implements),
+            ],
+        )
+        .unwrap();
+    let imported_types: Vec<DependencyType> = storage
+        .get_dependencies_full(&imported.id)
+        .unwrap()
+        .into_iter()
+        .map(|dep| dep.dep_type)
+        .collect();
+    assert_eq!(imported_types.len(), 2);
+    assert!(imported_types.contains(&DependencyType::Blocks));
+    assert!(imported_types.contains(&DependencyType::Implements));
 }
 
 #[test]
@@ -510,15 +577,17 @@ fn detect_all_cycles_finds_cycles() {
     storage.create_issue(&b, "tester").unwrap();
     storage.create_issue(&c, "tester").unwrap();
 
-    // Create cycle: A -> B -> C -> A
+    // Import a blocking cycle: A -> B -> C -> A. The normal add path rejects
+    // the closing edge, while cycle reporting must still diagnose imported or
+    // otherwise pre-existing invalid graphs.
     storage
-        .add_dependency(&a.id, &b.id, DependencyType::Related.as_str(), "tester")
+        .sync_dependencies_for_import(&a.id, &[imported_dependency(&a.id, &b.id)])
         .unwrap();
     storage
-        .add_dependency(&b.id, &c.id, DependencyType::Related.as_str(), "tester")
+        .sync_dependencies_for_import(&b.id, &[imported_dependency(&b.id, &c.id)])
         .unwrap();
     storage
-        .add_dependency(&c.id, &a.id, DependencyType::Related.as_str(), "tester")
+        .sync_dependencies_for_import(&c.id, &[imported_dependency(&c.id, &a.id)])
         .unwrap();
 
     let cycles = storage.detect_all_cycles().unwrap();
@@ -570,7 +639,7 @@ fn detect_all_cycles_finds_long_cycle_beyond_legacy_depth_cap() {
     for (index, id) in ids.iter().enumerate() {
         let next = &ids[(index + 1) % ids.len()];
         storage
-            .add_dependency(id, next, DependencyType::Related.as_str(), "tester")
+            .sync_dependencies_for_import(id, &[imported_dependency(id, next)])
             .unwrap();
     }
 
@@ -599,13 +668,14 @@ fn detect_all_cycles_collapses_dense_component_to_witness() {
     }
 
     for from in &ids {
-        for to in &ids {
-            if from != to {
-                storage
-                    .add_dependency(from, to, DependencyType::Related.as_str(), "tester")
-                    .unwrap();
-            }
-        }
+        let dependencies: Vec<_> = ids
+            .iter()
+            .filter(|to| *to != from)
+            .map(|to| imported_dependency(from, to))
+            .collect();
+        storage
+            .sync_dependencies_for_import(from, &dependencies)
+            .unwrap();
     }
 
     let cycles = storage.detect_all_cycles().unwrap();
@@ -619,7 +689,7 @@ fn detect_all_cycles_collapses_dense_component_to_witness() {
 }
 
 #[test]
-fn dependency_cycle_report_separates_active_from_archived_and_filters_blocking() {
+fn dependency_cycle_report_separates_archived_and_ignores_nonblocking_cycles() {
     let mut storage = test_db();
 
     let active_a = fixtures::issue("active-cycle-a");
@@ -645,35 +715,27 @@ fn dependency_cycle_report_separates_active_from_archived_and_filters_blocking()
     }
 
     storage
-        .add_dependency(
+        .sync_dependencies_for_import(
             &active_a.id,
+            &[imported_dependency(&active_a.id, &active_b.id)],
+        )
+        .unwrap();
+    storage
+        .sync_dependencies_for_import(
             &active_b.id,
-            DependencyType::Related.as_str(),
-            "tester",
+            &[imported_dependency(&active_b.id, &active_a.id)],
         )
         .unwrap();
     storage
-        .add_dependency(
-            &active_b.id,
-            &active_a.id,
-            DependencyType::Related.as_str(),
-            "tester",
-        )
-        .unwrap();
-    storage
-        .add_dependency(
+        .sync_dependencies_for_import(
             &archived_a.id,
-            &archived_b.id,
-            DependencyType::Related.as_str(),
-            "tester",
+            &[imported_dependency(&archived_a.id, &archived_b.id)],
         )
         .unwrap();
     storage
-        .add_dependency(
+        .sync_dependencies_for_import(
             &archived_b.id,
-            &archived_a.id,
-            DependencyType::Related.as_str(),
-            "tester",
+            &[imported_dependency(&archived_b.id, &archived_a.id)],
         )
         .unwrap();
     storage
@@ -694,7 +756,7 @@ fn dependency_cycle_report_separates_active_from_archived_and_filters_blocking()
         .unwrap();
 
     let all_report = storage.detect_dependency_cycle_report(false).unwrap();
-    assert_eq!(all_report.active_cycles.len(), 2);
+    assert_eq!(all_report.active_cycles.len(), 1);
     assert_eq!(all_report.archived_closed_cycles.len(), 1);
     assert!(
         all_report
@@ -706,7 +768,7 @@ fn dependency_cycle_report_separates_active_from_archived_and_filters_blocking()
         all_report
             .active_cycles
             .iter()
-            .any(|cycle| cycle.contains(&related_a.id) && cycle.contains(&related_b.id))
+            .all(|cycle| !cycle.contains(&related_a.id) && !cycle.contains(&related_b.id))
     );
     assert!(
         all_report
@@ -716,8 +778,7 @@ fn dependency_cycle_report_separates_active_from_archived_and_filters_blocking()
     );
 
     let blocking_report = storage.detect_dependency_cycle_report(true).unwrap();
-    assert!(blocking_report.active_cycles.is_empty());
-    assert!(blocking_report.archived_closed_cycles.is_empty());
+    assert_eq!(blocking_report, all_report);
 }
 
 // ============================================================================
@@ -1341,9 +1402,7 @@ fn test_dep_remove_parent_allows_subsequent_add() {
 
 /// uelt: every supported dep type round-trips through `add_dependency`,
 /// `get_dependencies`, and (for blocking types) blocked-cache rebuild.
-/// Exercises the full {blocks, parent-child, related, conditional-blocks,
-/// waits-for, discovered-from, replies-to, relates-to, duplicates,
-/// supersedes, caused-by} matrix.
+/// Exercises every first-class dependency relation.
 #[test]
 fn test_dep_add_each_supported_type_against_full_matrix() {
     let mut storage = test_db();
@@ -1356,6 +1415,8 @@ fn test_dep_add_each_supported_type_against_full_matrix() {
         "blocks",
         "parent-child", // ← exactly one allowed
         "related",
+        "derived-from",
+        "implements",
         "conditional-blocks",
         "waits-for",
         "discovered-from",

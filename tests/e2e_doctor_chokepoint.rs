@@ -47,6 +47,10 @@ use tempfile::TempDir;
 // Helpers
 // ---------------------------------------------------------------------------
 
+fn isolated_tempdir() -> TempDir {
+    TempDir::new_in(common::cli::isolated_temp_root()).expect("create isolated temp dir")
+}
+
 /// Make a fresh `br` invocation rooted at `cwd` with a hermetic env so
 /// tests don't pick up the developer's shell config.
 fn br_cmd(cwd: &Path) -> Command {
@@ -112,6 +116,21 @@ fn walk_workspace_hashes(dir: &Path, root: &Path, out: &mut BTreeMap<PathBuf, St
         if rel == Path::new(".beads/.write.lock") {
             continue;
         }
+        if rel.parent() == Some(Path::new(".beads"))
+            && rel
+                .file_name()
+                .and_then(|name| name.to_str())
+                .and_then(|name| name.strip_prefix(".br-db-write-"))
+                .and_then(|digest| digest.strip_suffix(".lock"))
+                .is_some_and(|digest| {
+                    digest.len() == 24
+                        && digest
+                            .bytes()
+                            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+                })
+        {
+            continue;
+        }
         let ft = entry.file_type().expect("file_type");
         if ft.is_dir() {
             walk_workspace_hashes(&path, root, out);
@@ -172,23 +191,17 @@ fn parse_trailing_json(stdout: &str) -> Value {
         .unwrap_or_else(|e| panic!("parse JSON failed ({e}): {}", &trimmed[start..]))
 }
 
-fn doctor_check<'a>(payload: &'a Value, name: &str) -> &'a Value {
-    payload["checks"]
-        .as_array()
-        .and_then(|checks| checks.iter().find(|check| check["name"] == name))
-        .unwrap_or_else(|| panic!("doctor output omitted check {name}: {payload}"))
-}
-
 fn seed_blocked_cache_db(db_path: &Path, blocked_by: &str) {
     let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
     conn.execute(
-        "CREATE TABLE blocked_issues_cache (
+        "CREATE TABLE IF NOT EXISTS blocked_issues_cache (
             issue_id TEXT PRIMARY KEY,
             blocked_by TEXT NOT NULL,
             blocked_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
         )",
     )
     .unwrap();
+    conn.execute("DELETE FROM blocked_issues_cache").unwrap();
     conn.execute(&format!(
         "INSERT INTO blocked_issues_cache(issue_id, blocked_by, blocked_at) \
          VALUES ('bd-1', '{blocked_by}', '2026-05-01 00:00:00')"
@@ -312,7 +325,7 @@ fn single_cache_row(db_path: &Path) -> (String, String) {
 #[test]
 #[allow(clippy::too_many_lines)]
 fn chokepoint_round_trip_gitignore() {
-    let tmp = TempDir::new().expect("tempdir");
+    let tmp = isolated_tempdir();
     let root = tmp.path().to_path_buf();
 
     br_init(&root);
@@ -486,7 +499,7 @@ fn chokepoint_round_trip_gitignore() {
 
 #[test]
 fn repair_refuses_when_run_dir_creation_fails() {
-    let tmp = TempDir::new().expect("tempdir");
+    let tmp = isolated_tempdir();
     let root = tmp.path().to_path_buf();
     br_init(&root);
     corrupt_root_gitignore(&root);
@@ -547,7 +560,7 @@ fn repair_refuses_when_run_dir_creation_fails() {
 #[test]
 #[ignore = "WP3 incomplete: --dry-run still creates repair run-dir/gitignore scaffolding before pure dry-run preflight"]
 fn chokepoint_dry_run_writes_no_files() {
-    let tmp = TempDir::new().expect("tempdir");
+    let tmp = isolated_tempdir();
     let root = tmp.path().to_path_buf();
     br_init(&root);
     corrupt_root_gitignore(&root);
@@ -587,7 +600,7 @@ fn chokepoint_dry_run_writes_no_files() {
 
 #[test]
 fn chokepoint_idempotence() {
-    let tmp = TempDir::new().expect("tempdir");
+    let tmp = isolated_tempdir();
     let root = tmp.path().to_path_buf();
     br_init(&root);
     corrupt_root_gitignore(&root);
@@ -663,7 +676,7 @@ fn chokepoint_idempotence() {
 
 #[test]
 fn chokepoint_undo_latest_resolves() {
-    let tmp = TempDir::new().expect("tempdir");
+    let tmp = isolated_tempdir();
     let root = tmp.path().to_path_buf();
     br_init(&root);
     corrupt_root_gitignore(&root);
@@ -708,7 +721,7 @@ fn chokepoint_undo_latest_resolves() {
 
 #[test]
 fn chokepoint_capabilities_envelope_v1() {
-    let tmp = TempDir::new().expect("tempdir");
+    let tmp = isolated_tempdir();
     let root = tmp.path().to_path_buf();
     // capabilities is repo-independent; we just need a cwd.
 
@@ -766,7 +779,7 @@ fn chokepoint_capabilities_envelope_v1() {
 
 #[test]
 fn chokepoint_robot_triage_envelope_v1() {
-    let tmp = TempDir::new().expect("tempdir");
+    let tmp = isolated_tempdir();
     let root = tmp.path().to_path_buf();
     br_init(&root);
 
@@ -840,7 +853,7 @@ fn chokepoint_robot_triage_envelope_v1() {
 #[test]
 #[allow(clippy::too_many_lines)]
 fn chokepoint_db_exec_round_trip() {
-    let tmp = TempDir::new().expect("tempdir");
+    let tmp = isolated_tempdir();
     let root = tmp.path().to_path_buf();
     let beads_dir = root.join(".beads");
     fs::create_dir_all(&beads_dir).expect("mkdir .beads");
@@ -942,11 +955,23 @@ fn chokepoint_db_exec_round_trip() {
 
 #[test]
 fn chokepoint_db_exec_undo_replay() {
-    let tmp = TempDir::new().expect("tempdir");
+    let tmp = isolated_tempdir();
     let root = tmp.path().to_path_buf();
     let beads_dir = root.join(".beads");
-    fs::create_dir_all(&beads_dir).expect("mkdir .beads");
+    br_init(&root);
     let db_path = beads_dir.join("beads.db");
+
+    let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+    conn.execute(
+        "INSERT INTO issues (
+            id, title, status, priority, issue_type, created_at, updated_at
+         ) VALUES (
+            'bd-1', 'Cache recovery fixture', 'open', 2, 'task',
+            '2026-05-01 00:00:00', '2026-05-01 00:00:00'
+         )",
+    )
+    .unwrap();
+    conn.close().unwrap();
 
     // Build the DB with a corrupt cache row.
     seed_blocked_cache_db(&db_path, "[\"WRONG\"]");
@@ -978,8 +1003,9 @@ fn chokepoint_db_exec_undo_replay() {
         .expect("invoke br doctor undo");
     assert!(
         output.status.success(),
-        "br doctor undo failed: status={:?} stderr={}",
+        "br doctor undo failed: status={:?}\nstdout={}\nstderr={}",
         output.status,
+        String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
 
@@ -1014,7 +1040,7 @@ fn chokepoint_db_exec_undo_replay() {
 
 #[test]
 fn chokepoint_repair_acquires_workspace_lock() {
-    let tmp = TempDir::new().expect("tempdir");
+    let tmp = isolated_tempdir();
     let root = tmp.path().to_path_buf();
 
     // Init a real workspace so .beads/.write.lock has a parent that
@@ -1127,7 +1153,7 @@ fn chokepoint_repair_acquires_workspace_lock() {
 fn chokepoint_repair_dry_run_refuses_on_lock_contention() {
     use std::time::{Duration, Instant};
 
-    let tmp = TempDir::new().expect("tempdir");
+    let tmp = isolated_tempdir();
     let root = tmp.path().to_path_buf();
     br_init(&root);
 
@@ -1203,7 +1229,7 @@ fn chokepoint_repair_dry_run_refuses_on_lock_contention() {
 /// remain unchanged on refusal.
 #[test]
 fn chokepoint_refuse_gate_blocks_downgrade() {
-    let tmp = TempDir::new().expect("tempdir");
+    let tmp = isolated_tempdir();
     let root = tmp.path().to_path_buf();
 
     // Real init so .beads/.write.lock + metadata.json + a real DB
@@ -1316,7 +1342,7 @@ fn chokepoint_refuse_gate_blocks_downgrade() {
 /// refuse-unsafe gates before snapshotting or running REINDEX.
 #[test]
 fn chokepoint_repair_indexes_refuse_gate_blocks_downgrade() {
-    let tmp = TempDir::new().expect("tempdir");
+    let tmp = isolated_tempdir();
     let root = tmp.path().to_path_buf();
 
     br_init(&root);
@@ -1405,7 +1431,7 @@ fn chokepoint_repair_indexes_refuse_gate_blocks_downgrade() {
 
 #[test]
 fn chokepoint_doctor_in_non_beads_dir_exits_no_input() {
-    let tmp = TempDir::new().expect("tempdir");
+    let tmp = isolated_tempdir();
     let root = tmp.path().to_path_buf();
     // Intentionally NO `br init` — this dir has no `.beads/`.
     assert!(!root.join(".beads").exists());
@@ -1449,7 +1475,7 @@ fn chokepoint_doctor_in_non_beads_dir_exits_no_input() {
 #[test]
 #[allow(clippy::too_many_lines)]
 fn legacy_op_audit_for_vacuum_via_page_corruption() {
-    let tmp = TempDir::new().expect("tempdir");
+    let tmp = isolated_tempdir();
     let root = tmp.path().to_path_buf();
     br_init(&root);
 
@@ -1703,7 +1729,7 @@ fn seed_dirty_issue_and_corrupt_db(root: &Path) -> String {
 
 #[test]
 fn repair_rebuild_preserves_dirty_unflushed_issue() {
-    let tmp = TempDir::new().expect("tempdir");
+    let tmp = isolated_tempdir();
     let root = tmp.path().to_path_buf();
     let dirty_id = seed_dirty_issue_and_corrupt_db(&root);
 
@@ -1771,7 +1797,7 @@ fn startup_auto_recovery_preserves_dirty_unflushed_issue() {
     // Same corruption, but recovered by the startup probe's automatic
     // rebuild (config-layer `rebuild_with_tombstone_preservation`) when a
     // plain read command opens the workspace — no doctor involved.
-    let tmp = TempDir::new().expect("tempdir");
+    let tmp = isolated_tempdir();
     let root = tmp.path().to_path_buf();
     let dirty_id = seed_dirty_issue_and_corrupt_db(&root);
 
@@ -1809,8 +1835,11 @@ fn startup_auto_recovery_preserves_dirty_unflushed_issue() {
 }
 
 #[test]
+// Plan, apply, refusal, and undo must share one copied workspace so receipt
+// identity and non-deletion postconditions are proven across the lifecycle.
+#[allow(clippy::too_many_lines)]
 fn e2e_reviewed_schema_migration_plan_apply_barrier_and_non_deleting_undo() {
-    let temp = TempDir::new().expect("tempdir");
+    let temp = isolated_tempdir();
     let root = temp.path().to_path_buf();
     br_init(&root);
     let db_path = root.join(".beads/beads.db");
@@ -1869,7 +1898,7 @@ fn e2e_reviewed_schema_migration_plan_apply_barrier_and_non_deleting_undo() {
     );
     assert_eq!(plan_json["eligible"], true);
     assert_eq!(plan_json["from_version"], 14);
-    assert_eq!(plan_json["to_version"], 15);
+    assert_eq!(plan_json["to_version"], 19);
     let token = plan_json["plan_token"]
         .as_str()
         .expect("plan token")
@@ -1906,7 +1935,7 @@ fn e2e_reviewed_schema_migration_plan_apply_barrier_and_non_deleting_undo() {
         .as_str()
         .expect("migration run id")
         .to_string();
-    assert_eq!(db_user_version(&db_path), 15);
+    assert_eq!(db_user_version(&db_path), 19);
     let run_dir = root
         .join(".beads/.br_recovery/schema-migrations")
         .join(&run_id);
@@ -1942,7 +1971,7 @@ fn e2e_reviewed_schema_migration_plan_apply_barrier_and_non_deleting_undo() {
         String::from_utf8_lossy(&undo_plan.stdout),
         String::from_utf8_lossy(&undo_plan.stderr)
     );
-    assert_eq!(db_user_version(&db_path), 15);
+    assert_eq!(db_user_version(&db_path), 19);
 
     let undo = br_cmd(&root)
         .args(["doctor", "migrate-schema", "undo", &run_id, "--json"])

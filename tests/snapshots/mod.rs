@@ -47,6 +47,9 @@ static ANSI_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\x1b\[[0-9;]*m").expect("ansi regex"));
 static ID_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\b[a-zA-Z0-9_-]+-[a-z0-9]{3,}\b").expect("id regex"));
+/// Stable hyphenated CLI tokens that the deliberately broad issue-ID
+/// heuristic must preserve verbatim.
+const ID_RE_FALSE_POSITIVES: &[&str] = &["vcs-status"];
 static TS_FULL_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:?\d{2})?")
         .expect("full timestamp regex")
@@ -444,7 +447,16 @@ fn normalize_text_with_log(text: &str, config: &TextNormConfig) -> (String, Vec<
 
     // 6. Redact issue IDs
     if config.redact_ids && ID_RE.is_match(&normalized) {
-        normalized = ID_RE.replace_all(&normalized, "ID-REDACTED").to_string();
+        normalized = ID_RE
+            .replace_all(&normalized, |captures: &regex::Captures<'_>| {
+                let matched = captures.get(0).map_or("", |value| value.as_str());
+                if ID_RE_FALSE_POSITIVES.contains(&matched) {
+                    matched.to_string()
+                } else {
+                    "ID-REDACTED".to_string()
+                }
+            })
+            .to_string();
         log.push("issue_ids".to_string());
     }
 
@@ -1024,6 +1036,14 @@ mod golden_snapshot_tests {
         assert!(!result.contains("\x1b["));
         assert!(result.contains("ID-REDACTED"));
         assert!(result.contains("YYYY-MM-DDTHH:MM:SS"));
+    }
+
+    #[test]
+    fn test_normalize_output_preserves_vcs_status_command() {
+        let input = "vcs-status bd-abc";
+        let result = normalize_output(input);
+
+        assert_eq!(result, "vcs-status ID-REDACTED");
     }
 
     #[test]

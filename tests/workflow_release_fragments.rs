@@ -10,6 +10,7 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
 const RELEASE_WORKFLOW: &str = ".github/workflows/release.yml";
+const FIXTURE_ASSET_VERSION: &str = "9.9.9";
 const REQUIRED_PLATFORMS: &[&str] = &[
     "linux_amd64",
     "linux_musl_amd64",
@@ -62,7 +63,8 @@ fn release_workflow_exposes_expected_fragment_steps() -> Result<(), String> {
 fn release_workflow_uses_tagless_asset_file_names() -> Result<(), String> {
     let workflow = read_to_string(Path::new(RELEASE_WORKFLOW))?;
 
-    require_contains(&workflow, r#"ASSET_VERSION="${GITHUB_REF_NAME#v}""#)?;
+    require_contains(&workflow, r#"TAG="${INPUT_TAG:-$GITHUB_REF_NAME}""#)?;
+    require_contains(&workflow, r#"ASSET_VERSION="${TAG#v}""#)?;
     require_contains(
         &workflow,
         "br-${{ steps.asset_version.outputs.asset_version }}-${{ matrix.name }}",
@@ -114,7 +116,14 @@ fn reliability_override_fragment_requires_reason_and_records_summary() -> Result
 
 #[test]
 fn required_artifact_fragment_reports_missing_platforms() -> Result<(), String> {
-    let script = release_step_script("Validate required artifacts present")?;
+    // GitHub expands step-output expressions before handing `run` to Bash.
+    // Render the one expression this focused harness depends on so the test
+    // executes the same shell fragment rather than feeding GitHub syntax to a
+    // standalone Bash process.
+    let script = release_step_script("Validate required artifacts present")?.replace(
+        "${{ steps.asset_version.outputs.asset_version }}",
+        FIXTURE_ASSET_VERSION,
+    );
     let fixture = WorkflowFixture::new()?;
     fixture.create_artifacts_dir()?;
     for platform in REQUIRED_PLATFORMS {

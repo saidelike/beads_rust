@@ -51,11 +51,15 @@ br delete <id>                                       # Delete issue (tombstone)
 ```bash
 br create --actor "$ACTOR" "Title" \
   --priority 1 \             # 0=critical, 1=high, 2=medium, 3=low, 4=backlog
-  --type task \              # task, bug, feature, epic, question, docs
+  --type task \              # Use capabilities issue_types acceptance metadata
   --assignee "user@..." \    # Optional assignee
   --labels backend,auth \    # Comma-separated labels
   --description "..."        # Detailed description
 ```
+
+For type selection, run `br capabilities --format json` in the target
+workspace. `standard_types` and registered `types` keys are suggestions;
+`types` is not an allowlist, so honor `accepts_custom_types` for other names.
 
 ### Update Options
 

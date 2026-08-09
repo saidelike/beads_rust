@@ -1,9 +1,13 @@
 use assert_cmd::prelude::*;
 use std::process::Command;
 
+#[allow(dead_code)]
+#[path = "common/cli.rs"]
+mod common_cli;
+
 #[test]
 fn test_create_json_output_is_single_object() {
-    let temp = tempfile::tempdir().unwrap();
+    let temp = tempfile::TempDir::new_in(common_cli::isolated_temp_root()).unwrap();
     let path = temp.path();
 
     let bin = assert_cmd::cargo::cargo_bin!("br");
@@ -43,7 +47,7 @@ fn test_create_json_output_is_single_object() {
 
 #[test]
 fn test_create_dry_run_plain_output_is_line_oriented() {
-    let temp = tempfile::tempdir().unwrap();
+    let temp = tempfile::TempDir::new_in(common_cli::isolated_temp_root()).unwrap();
     let path = temp.path();
 
     let bin = assert_cmd::cargo::cargo_bin!("br");

@@ -621,9 +621,11 @@ fn prepare_delete_route(
 ) -> Result<PreparedDeleteRoute> {
     let routed_write_lock =
         acquire_routed_workspace_write_lock(beads_dir, auto_flush_external, cli.lock_timeout)?;
-    let mut storage_ctx = config::open_storage_with_cli(beads_dir, cli)?;
-    auto_import_storage_ctx_if_stale(&mut storage_ctx, cli)?;
-    let config_layer = storage_ctx.load_config(cli)?;
+    let mut route_cli = cli.clone();
+    routed_write_lock.mark_cli_write_lock_held(&mut route_cli);
+    let mut storage_ctx = config::open_storage_with_cli(beads_dir, &route_cli)?;
+    auto_import_storage_ctx_if_stale(&mut storage_ctx, &route_cli)?;
+    let config_layer = storage_ctx.load_config(&route_cli)?;
     let id_config = config::id_config_from_layer(&config_layer);
     let resolver = IdResolver::new(ResolverConfig::with_prefix(id_config.prefix));
     let resolved_ids = sorted_unique_strings(resolve_issue_ids(
@@ -647,7 +649,7 @@ fn prepare_delete_route(
 
     Ok(PreparedDeleteRoute {
         beads_dir: beads_dir.to_path_buf(),
-        route_cli: cli.clone(),
+        route_cli,
         resolved_ids,
         blocked_dependents,
         cascade_delete,

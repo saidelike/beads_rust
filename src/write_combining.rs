@@ -1775,6 +1775,7 @@ mod tests {
             command: DepCommands::Remove(DepRemoveArgs {
                 issue: "br-1".to_string(),
                 depends_on: "br-2".to_string(),
+                dep_type: None,
             }),
         };
 
@@ -1861,6 +1862,7 @@ mod tests {
                 prefix: None,
                 force: false,
                 backend: None,
+                redirect: None,
             }),
             CommandCompatibility::DirectOnly(DirectOnlyReason::UnsafeCommand)
         );

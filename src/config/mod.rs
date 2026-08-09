@@ -26,8 +26,8 @@ use crate::sync::{
     tombstones_missing_from_jsonl_tombstones, verify_jsonl_source_snapshot_current,
 };
 use crate::util::id::{
-    IdConfig, abbreviate_prefix, normalize_configured_prefix, normalize_prefix, parse_id,
-    split_prefix_remainder,
+    IdConfig, IdGenerationConfig, IdGenerationMode, abbreviate_prefix, normalize_configured_prefix,
+    normalize_prefix, parse_id, split_prefix_remainder,
 };
 use chrono::Utc;
 use fsqlite_error::FrankenError;
@@ -1321,7 +1321,7 @@ fn rebuild_with_tombstone_preservation(
         paths,
         lock_timeout,
         bootstrap_layer,
-        import_config,
+        &import_config,
         &source,
         &jsonl_authority,
         write_authority,
@@ -1372,7 +1372,7 @@ fn rebuild_database_from_jsonl(
         paths,
         lock_timeout,
         bootstrap_layer,
-        import_config,
+        &import_config,
         &source,
         &jsonl_authority,
         write_authority,
@@ -1392,7 +1392,7 @@ fn rebuild_database_from_jsonl_snapshot(
     paths: &ConfigPaths,
     lock_timeout: Option<u64>,
     bootstrap_layer: &ConfigLayer,
-    import_config: ImportConfig,
+    import_config: &ImportConfig,
     source: &JsonlSourceSnapshot,
     jsonl_authority: &crate::sync::JsonlFamilyWriteLock,
     write_authority: &Arc<crate::sync::DatabaseFamilyWriteLock>,
@@ -1507,7 +1507,7 @@ pub(crate) fn repair_database_from_jsonl_snapshot_under_write_authority(
         db_path,
         lock_timeout,
         bootstrap_layer,
-        import_config,
+        &import_config,
         source,
         jsonl_authority,
         write_authority,
@@ -1520,7 +1520,7 @@ pub(crate) fn repair_database_from_jsonl_snapshot_with_import_config(
     db_path: &Path,
     lock_timeout: Option<u64>,
     bootstrap_layer: &ConfigLayer,
-    import_config: ImportConfig,
+    import_config: &ImportConfig,
     source: &JsonlSourceSnapshot,
     jsonl_authority: &crate::sync::JsonlFamilyWriteLock,
 ) -> Result<(SqliteStorage, ImportResult, Vec<RecoveryBackupVerification>)> {
@@ -1547,7 +1547,7 @@ pub(crate) fn repair_database_from_jsonl_snapshot_with_import_config_under_write
     db_path: &Path,
     lock_timeout: Option<u64>,
     bootstrap_layer: &ConfigLayer,
-    import_config: ImportConfig,
+    import_config: &ImportConfig,
     source: &JsonlSourceSnapshot,
     jsonl_authority: &crate::sync::JsonlFamilyWriteLock,
     write_authority: &Arc<crate::sync::DatabaseFamilyWriteLock>,
@@ -1573,7 +1573,7 @@ fn repair_database_from_jsonl_snapshot_with_import_config_deferred(
     db_path: &Path,
     lock_timeout: Option<u64>,
     bootstrap_layer: &ConfigLayer,
-    import_config: ImportConfig,
+    import_config: &ImportConfig,
     source: &JsonlSourceSnapshot,
     jsonl_authority: &crate::sync::JsonlFamilyWriteLock,
     write_authority: &Arc<crate::sync::DatabaseFamilyWriteLock>,
@@ -1597,7 +1597,7 @@ fn repair_database_from_jsonl_snapshot_with_import_config_under_write_authority_
     db_path: &Path,
     lock_timeout: Option<u64>,
     bootstrap_layer: &ConfigLayer,
-    import_config: ImportConfig,
+    import_config: &ImportConfig,
     source: &JsonlSourceSnapshot,
     jsonl_authority: &crate::sync::JsonlFamilyWriteLock,
     write_authority: &Arc<crate::sync::DatabaseFamilyWriteLock>,
@@ -1606,10 +1606,12 @@ fn repair_database_from_jsonl_snapshot_with_import_config_under_write_authority_
     write_authority.verify_database_authority()?;
     jsonl_authority.verify_jsonl_authority()?;
     let prefix = resolve_bootstrap_issue_prefix_snapshot(bootstrap_layer, beads_dir, source)?;
+    let expected_prefix = import_expected_prefix(bootstrap_layer, &prefix);
 
-    let mut preflight_config = import_config.clone();
+    let mut preflight_config = (*import_config).clone();
     preflight_config.skip_prefix_validation = true;
-    preflight_import_snapshot(source, &preflight_config, Some(&prefix))?.into_result()?;
+    preflight_import_snapshot(source, &preflight_config, expected_prefix.as_deref())
+        .into_result()?;
     let current_source = crate::sync::capture_jsonl_source_snapshot(source.display_path())?;
     if current_source.state_witness() != source.state_witness() {
         return Err(BeadsError::SyncConflict {
@@ -1634,8 +1636,9 @@ fn repair_database_from_jsonl_snapshot_with_import_config_under_write_authority_
                 db_path,
                 lock_timeout,
                 source,
-                &import_config,
+                import_config,
                 &prefix,
+                expected_prefix.as_deref(),
                 write_authority,
             )?;
             jsonl_authority.verify_jsonl_authority()?;
@@ -2028,6 +2031,7 @@ fn rebuild_database_family(
     source: &JsonlSourceSnapshot,
     import_config: &ImportConfig,
     prefix: &str,
+    expected_prefix: Option<&str>,
     write_authority: &Arc<crate::sync::DatabaseFamilyWriteLock>,
 ) -> Result<(SqliteStorage, ImportResult)> {
     write_authority.verify_database_authority()?;
@@ -2036,7 +2040,7 @@ fn rebuild_database_family(
     write_authority.verify_database_authority()?;
     storage.set_config("issue_prefix", prefix)?;
     let import_result =
-        import_from_jsonl_snapshot(&mut storage, source, import_config, Some(prefix))?;
+        import_from_jsonl_snapshot(&mut storage, source, import_config, expected_prefix)?;
 
     // Drain the WAL to the main DB file so the follow-up maintenance (VACUUM,
     // REINDEX, VACUUM INTO) operates against what is actually on disk.
@@ -2896,6 +2900,14 @@ where
         .collect())
 }
 
+fn install_project_policy(storage: &mut SqliteStorage, beads_dir: &Path) -> Result<()> {
+    let policy = crate::close_policy::load_for_beads_dir(beads_dir)?;
+    let registry = crate::close_policy::TypeCapabilityRegistry::resolve(&policy.issue_types)?;
+    storage.set_workflow_policy(policy.workflow);
+    storage.set_issue_type_registry(registry);
+    Ok(())
+}
+
 /// Open storage using resolved config paths, returning the storage and paths used.
 ///
 /// # Errors
@@ -2929,8 +2941,7 @@ pub fn open_storage(
     )?;
     write_authority.verify_database_authority()?;
     open_result.storage.attach_write_authority(write_authority);
-    let workflow = crate::close_policy::load_for_beads_dir(beads_dir)?.workflow;
-    open_result.storage.set_workflow_policy(workflow);
+    install_project_policy(&mut open_result.storage, beads_dir)?;
     Ok((open_result.storage, startup.paths))
 }
 
@@ -2961,8 +2972,8 @@ pub struct OpenStorageResult {
     pub storage: SqliteStorage,
     pub paths: ConfigPaths,
     pub no_db: bool,
-    _write_authority: Option<Arc<crate::sync::DatabaseFamilyWriteLock>>,
-    _jsonl_write_authority: Option<Arc<crate::sync::JsonlFamilyWriteLock>>,
+    write_authority: Option<Arc<crate::sync::DatabaseFamilyWriteLock>>,
+    jsonl_write_authority: Option<Arc<crate::sync::JsonlFamilyWriteLock>>,
     /// True when the SQLite DB file was just rebuilt from JSONL during this
     /// `open_storage_with_cli` call (either because the file didn't exist, or
     /// because a recoverable anomaly was detected after opening). Callers that
@@ -2997,7 +3008,7 @@ impl OpenStorageResult {
         (
             &mut self.storage,
             source,
-            self._jsonl_write_authority.as_deref(),
+            self.jsonl_write_authority.as_deref(),
         )
     }
 
@@ -3020,7 +3031,7 @@ impl OpenStorageResult {
             &mut self.storage,
             source,
             &self.loaded_jsonl_state,
-            self._jsonl_write_authority.as_deref(),
+            self.jsonl_write_authority.as_deref(),
         )
     }
 
@@ -3094,7 +3105,7 @@ impl OpenStorageResult {
             ));
         }
         let write_authority =
-            self._write_authority
+            self.write_authority
                 .clone()
                 .ok_or_else(|| BeadsError::SyncConflict {
                     message: "Database recovery requires an owned database-family authority"
@@ -3143,7 +3154,7 @@ impl OpenStorageResult {
                 &self.paths.db_path,
                 self.resolved_lock_timeout,
                 &self.bootstrap_layer,
-                import_config,
+                &import_config,
                 &source,
                 &jsonl_authority,
                 &write_authority,
@@ -3161,13 +3172,13 @@ impl OpenStorageResult {
         }
         self.loaded_jsonl_state = source.state_witness();
         self.loaded_jsonl_source = RetainedJsonlSource::Present(source);
-        self._jsonl_write_authority = Some(jsonl_authority);
+        self.jsonl_write_authority = Some(jsonl_authority);
         self.auto_rebuilt = true;
         Ok(())
     }
 
     pub(crate) fn verify_retained_jsonl_source_current(&self) -> Result<()> {
-        let Some(jsonl_authority) = self._jsonl_write_authority.as_deref() else {
+        let Some(jsonl_authority) = self.jsonl_write_authority.as_deref() else {
             return Ok(());
         };
         match &self.loaded_jsonl_source {
@@ -3195,15 +3206,15 @@ impl OpenStorageResult {
         source: Arc<JsonlSourceSnapshot>,
         owned_authority: Option<crate::sync::JsonlFamilyWriteLock>,
     ) -> Result<()> {
-        if self._jsonl_write_authority.is_some() && owned_authority.is_some() {
+        if self.jsonl_write_authority.is_some() && owned_authority.is_some() {
             return Err(BeadsError::SyncConflict {
                 message:
                     "Published JSONL adoption received a second authority while startup still retains one"
                         .to_string(),
             });
         }
-        if self._jsonl_write_authority.is_none() {
-            self._jsonl_write_authority = Some(match owned_authority {
+        if self.jsonl_write_authority.is_none() {
+            self.jsonl_write_authority = Some(match owned_authority {
                 Some(authority) => Arc::new(authority),
                 None => Arc::new(crate::sync::blocking_jsonl_family_write_lock_with_timeout(
                     &self.paths.jsonl_path,
@@ -3212,7 +3223,7 @@ impl OpenStorageResult {
             });
         }
         let authority = self
-            ._jsonl_write_authority
+            .jsonl_write_authority
             .as_deref()
             .expect("published JSONL adoption retains an authority");
         verify_jsonl_source_snapshot_current(&source, authority)?;
@@ -3226,7 +3237,7 @@ impl OpenStorageResult {
         expected_authority_sha256: &str,
     ) -> Result<()> {
         let authority =
-            self._jsonl_write_authority
+            self.jsonl_write_authority
                 .as_deref()
                 .ok_or_else(|| BeadsError::SyncConflict {
                     message: "Published JSONL adoption did not retain its JSONL-family authority"
@@ -3250,7 +3261,7 @@ impl OpenStorageResult {
     }
 
     pub(crate) fn discard_pending_recovery_backup(&mut self) -> Result<()> {
-        if let Some(write_authority) = self._write_authority.as_ref() {
+        if let Some(write_authority) = self.write_authority.as_ref() {
             write_authority.finalize_database_replacement()?;
         }
         self.pending_recovery_backup = None;
@@ -3274,12 +3285,12 @@ impl OpenStorageResult {
             .files
             .iter()
             .any(|(_, backup)| fs::symlink_metadata(backup).is_ok());
-        if backup_artifacts_remain {
+        if backup_artifacts_remain || !had_original_database_family {
             restore_database_family_after_failed_rebuild(&backup_set)?;
         }
         if had_original_database_family {
             let write_authority =
-                self._write_authority
+                self.write_authority
                     .as_ref()
                     .ok_or_else(|| {
                         BeadsError::SyncConflict {
@@ -3302,7 +3313,7 @@ impl OpenStorageResult {
             write_authority.verify_database_authority()?;
             restored_storage.attach_write_authority(Arc::clone(write_authority));
             self.storage = restored_storage;
-        } else if let Some(write_authority) = self._write_authority.as_ref() {
+        } else if let Some(write_authority) = self.write_authority.as_ref() {
             write_authority.clear_database_inode_after_authorized_remove()?;
         }
         self.loaded_jsonl_state = JsonlSourceStateWitness::Missing;
@@ -3334,7 +3345,7 @@ impl OpenStorageResult {
 
         let history_config = self.resolved_history_config();
         let jsonl_write_authority =
-            self._jsonl_write_authority
+            self.jsonl_write_authority
                 .as_ref()
                 .ok_or_else(|| BeadsError::SyncConflict {
                     message: "Mutating no-DB session has no retained JSONL-family write authority"
@@ -3525,7 +3536,7 @@ fn open_storage_with_owned_write_authority(
             Some(authority),
             allow_external_jsonl,
         )?;
-        result._write_authority = Some(Arc::clone(authority));
+        result.write_authority = Some(Arc::clone(authority));
         return Ok(result);
     }
     if cli.holds_write_lock_for(&startup.paths.beads_dir) {
@@ -3562,7 +3573,7 @@ fn open_storage_with_owned_write_authority(
         Some(&authority),
         allow_external_jsonl,
     )?;
-    result._write_authority = Some(authority);
+    result.write_authority = Some(authority);
     Ok(result)
 }
 
@@ -3592,7 +3603,7 @@ pub fn open_storage_with_startup_config_under_write_lock(
         Some(authority),
         false,
     )?;
-    result._write_authority = Some(Arc::clone(authority));
+    result.write_authority = Some(Arc::clone(authority));
     Ok(result)
 }
 
@@ -3697,6 +3708,9 @@ fn open_sqlite_storage_for_startup(
     }
 }
 
+// Audited startup state machine: the no-DB and SQLite branches must derive
+// paths, locks, snapshots, and retained authorities from one merged config.
+#[allow(clippy::too_many_lines)]
 fn open_storage_with_startup_config_impl(
     startup: StartupConfig,
     cli: &CliOverrides,
@@ -3773,8 +3787,7 @@ fn open_storage_with_startup_config_impl(
             authority.verify_jsonl_authority()?;
         }
 
-        let workflow = crate::close_policy::load_for_beads_dir(&beads_dir)?.workflow;
-        storage.set_workflow_policy(workflow);
+        install_project_policy(&mut storage, &beads_dir)?;
 
         let loaded_jsonl_source = loaded_jsonl_snapshot
             .map_or(RetainedJsonlSource::Missing, |source| {
@@ -3784,8 +3797,8 @@ fn open_storage_with_startup_config_impl(
             storage,
             paths,
             no_db,
-            _write_authority: None,
-            _jsonl_write_authority: jsonl_write_authority,
+            write_authority: None,
+            jsonl_write_authority,
             auto_rebuilt: false,
             allow_external_jsonl,
             startup_layers,
@@ -3814,8 +3827,7 @@ fn open_storage_with_startup_config_impl(
                 .storage
                 .attach_write_authority(Arc::clone(authority));
         }
-        let workflow = crate::close_policy::load_for_beads_dir(&beads_dir)?.workflow;
-        sqlite_open.storage.set_workflow_policy(workflow);
+        install_project_policy(&mut sqlite_open.storage, &beads_dir)?;
         let (loaded_jsonl_state, loaded_jsonl_source, jsonl_write_authority) =
             match sqlite_open.recovered_jsonl {
                 Some(recovered) => {
@@ -3836,8 +3848,8 @@ fn open_storage_with_startup_config_impl(
             storage: sqlite_open.storage,
             paths,
             no_db,
-            _write_authority: owned_write_authority,
-            _jsonl_write_authority: jsonl_write_authority,
+            write_authority: owned_write_authority,
+            jsonl_write_authority,
             auto_rebuilt: sqlite_open.auto_rebuilt,
             allow_external_jsonl,
             startup_layers,
@@ -4060,6 +4072,25 @@ fn validate_configured_issue_prefix(layer: &ConfigLayer) -> Result<()> {
         normalize_configured_prefix(prefix)?;
     }
     Ok(())
+}
+
+fn validate_configured_id_generation(layer: &ConfigLayer) -> Result<()> {
+    let mode = get_value(layer, &["id_generation.mode", "id-generation.mode"])
+        .map_or(Ok(IdGenerationMode::Generated), |value| {
+            IdGenerationMode::parse(value)
+        })?;
+    if mode == IdGenerationMode::Templated {
+        crate::util::id::IdGenerator::new(id_config_from_layer(layer))
+            .validate_template_config()?;
+    }
+    Ok(())
+}
+
+fn import_expected_prefix(layer: &ConfigLayer, configured_prefix: &str) -> Option<String> {
+    let id_config = id_config_from_layer(layer);
+    let template_owns_full_id_shape = id_config.generation.mode == IdGenerationMode::Templated
+        && !id_config.generation.template.contains("{prefix}");
+    (!template_owns_full_id_shape).then(|| configured_prefix.to_string())
 }
 
 fn first_prefix_from_resolved_jsonl(
@@ -4675,6 +4706,7 @@ fn load_config_from_startup_layers(
 
     let merged = ConfigLayer::merge_layers(&layers);
     validate_configured_issue_prefix(&merged)?;
+    validate_configured_id_generation(&merged)?;
     Ok(merged)
 }
 
@@ -5187,12 +5219,40 @@ pub fn id_config_from_layer(layer: &ConfigLayer) -> IdConfig {
     let max_hash_length = parse_usize(layer, &["max_hash_length", "max-hash-length"]).unwrap_or(8);
     let max_collision_prob =
         parse_f64(layer, &["max_collision_prob", "max-collision-prob"]).unwrap_or(0.25);
+    let generation_mode = get_value(layer, &["id_generation.mode", "id-generation.mode"])
+        .and_then(|value| IdGenerationMode::parse(value).ok())
+        .unwrap_or(IdGenerationMode::Generated);
+    let generation_template =
+        get_value(layer, &["id_generation.template", "id-generation.template"])
+            .cloned()
+            .unwrap_or_else(|| "{prefix}-{hash}".to_string());
+    let require_slug = get_value(
+        layer,
+        &["id_generation.require_slug", "id-generation.require-slug"],
+    )
+    .and_then(|value| parse_bool(value))
+    .unwrap_or(false);
+    let allow_non_unique_template = get_value(
+        layer,
+        &[
+            "id_generation.allow_non_unique_template",
+            "id-generation.allow-non-unique-template",
+        ],
+    )
+    .and_then(|value| parse_bool(value))
+    .unwrap_or(false);
 
     IdConfig {
         prefix,
         min_hash_length,
         max_hash_length,
         max_collision_prob,
+        generation: IdGenerationConfig {
+            mode: generation_mode,
+            template: generation_template,
+            require_slug,
+            allow_non_unique_template,
+        },
     }
 }
 
@@ -5849,6 +5909,38 @@ labels:
         assert_eq!(config.min_hash_length, 4);
         assert_eq!(config.max_hash_length, 10);
         assert!((config.max_collision_prob - 0.5).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    #[allow(clippy::literal_string_with_formatting_args)]
+    fn id_config_parses_templated_generation_options() {
+        let yaml = r#"
+id_generation:
+  mode: templated
+  template: "{seq:03}-{slug}-{hash}"
+  require_slug: true
+  allow_non_unique_template: false
+"#;
+        let value: serde_yml::Value = serde_yml::from_str(yaml).expect("parse yaml");
+        let layer = layer_from_yaml_value(&value);
+        let config = id_config_from_layer(&layer);
+
+        assert_eq!(config.generation.mode, IdGenerationMode::Templated);
+        assert_eq!(config.generation.template, "{seq:03}-{slug}-{hash}");
+        assert!(config.generation.require_slug);
+        assert!(!config.generation.allow_non_unique_template);
+    }
+
+    #[test]
+    fn configured_id_generation_rejects_unknown_mode() {
+        let mut layer = ConfigLayer::default();
+        layer
+            .runtime
+            .insert("id_generation.mode".to_string(), "surprising".to_string());
+
+        let error =
+            validate_configured_id_generation(&layer).expect_err("unknown mode must be rejected");
+        assert!(error.to_string().contains("unsupported ID generation mode"));
     }
 
     #[test]
@@ -6891,6 +6983,43 @@ routing:
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn config_paths_preserve_symlink_sensitive_explicit_db_override() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new().expect("tempdir");
+        let beads_dir = temp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).expect("create workspace beads dir");
+
+        let physical_root = temp.path().join("physical");
+        let physical_child = physical_root.join("child");
+        let physical_beads = physical_root.join(".beads");
+        fs::create_dir_all(&physical_child).expect("create symlink target");
+        fs::create_dir_all(&physical_beads).expect("create target beads dir");
+        fs::write(physical_beads.join("beads.db"), b"database").expect("write target database");
+        fs::write(physical_beads.join("issues.jsonl"), b"\n").expect("write target jsonl");
+
+        let link = temp.path().join("link");
+        symlink(&physical_child, &link).expect("create directory symlink");
+        let override_path = link.join("..").join(".beads/beads.db");
+
+        let paths = ConfigPaths::resolve(&beads_dir, Some(&override_path)).expect("resolve paths");
+        assert_eq!(paths.db_path, override_path);
+        assert_eq!(
+            paths.jsonl_path,
+            link.join("..").join(".beads/issues.jsonl")
+        );
+        assert_eq!(
+            fs::canonicalize(&paths.db_path).expect("canonical database route"),
+            physical_beads.join("beads.db")
+        );
+        assert_eq!(
+            fs::canonicalize(&paths.jsonl_path).expect("canonical jsonl route"),
+            physical_beads.join("issues.jsonl")
+        );
+    }
+
     #[test]
     fn resolve_actor_falls_back_to_unknown() {
         let layer = ConfigLayer::default();
@@ -7491,6 +7620,38 @@ routing:
     }
 
     #[test]
+    fn open_storage_recovers_prefixless_templated_id_from_jsonl() {
+        let temp = TempDir::new().expect("tempdir");
+        let beads_dir = temp.path().join(".beads");
+        let db_path = beads_dir.join("beads.db");
+        let jsonl_path = beads_dir.join("issues.jsonl");
+        fs::create_dir_all(&beads_dir).expect("create beads dir");
+        fs::write(
+            beads_dir.join("config.yaml"),
+            r#"
+issue_prefix: bd
+id_generation:
+  mode: templated
+  template: "{slug}-{hash}"
+"#,
+        )
+        .expect("write templated ID config");
+        fs::write(&db_path, b"not a sqlite database").expect("write corrupt db");
+        write_single_issue_jsonl(&jsonl_path, "fix-login-abc", "Fix login");
+
+        let storage_ctx =
+            open_storage_with_cli(&beads_dir, &CliOverrides::default()).expect("recover storage");
+        let issue = storage_ctx
+            .storage
+            .get_issue("fix-login-abc")
+            .expect("query recovered issue")
+            .expect("prefixless templated ID should survive recovery");
+
+        assert_eq!(issue.id, "fix-login-abc");
+        assert_eq!(issue.title, "Fix login");
+    }
+
+    #[test]
     fn open_storage_with_cli_recovers_malformed_schema_db_from_valid_jsonl() {
         let temp = TempDir::new().expect("tempdir");
         let beads_dir = temp.path().join(".beads");
@@ -7757,8 +7918,6 @@ routing:
     }
 
     #[test]
-    #[ignore = "carried red from the stranded sync-safety workstream (failed identically on its own \
-                pre-merge snapshot); tracked for completion by the owning workstream"]
     fn deferred_recovery_restore_for_missing_db_cleans_up_fresh_database_family() {
         let temp = TempDir::new().expect("tempdir");
         let beads_dir = temp.path().join(".beads");
@@ -8688,7 +8847,7 @@ routing:
             &db_path,
             None,
             &bootstrap_layer,
-            import_config,
+            &import_config,
             &source,
             &jsonl_authority,
         )

@@ -12,11 +12,13 @@ mod resources;
 mod tools;
 
 use std::fs;
+use std::io::{self, BufRead, BufReader, Cursor, Read};
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, sync_channel};
 use std::sync::{Arc, Mutex};
-use std::time::UNIX_EPOCH;
+use std::time::{Duration, UNIX_EPOCH};
 
 use fastmcp_rust::{McpError, McpErrorCode, McpResult, StdioTransport};
 use serde_json::{Value, json};
@@ -29,6 +31,87 @@ use crate::{BeadsError, config};
 
 const MCP_READ_SNAPSHOT_ENV: &str = "BR_MCP_READ_SNAPSHOT";
 const MCP_READ_SNAPSHOT_CACHE_LIMIT: usize = 64;
+const MCP_STDIN_SHUTDOWN_POLL: Duration = Duration::from_millis(25);
+
+/// A stdin reader that lets the MCP server observe cooperative shutdown while
+/// no client request is in flight.
+///
+/// `fastmcp-rust` 0.3.2's synchronous [`StdioTransport`] checks its capability
+/// context before `read_line`, but a signal arriving after that check cannot
+/// interrupt the blocking OS read. Keep that read on a dedicated thread and
+/// let the server thread consume complete lines through a bounded channel.
+/// Returning EOF once br's shutdown flag is set makes FastMCP return through
+/// its embedding entrypoint, so `main` can unwind normally.
+struct CooperativeStdin {
+    receiver: Receiver<io::Result<Vec<u8>>>,
+    current_line: Cursor<Vec<u8>>,
+    shutdown_requested: Box<dyn Fn() -> bool + Send>,
+}
+
+impl CooperativeStdin {
+    fn spawn() -> io::Result<Self> {
+        Self::spawn_reader(BufReader::new(io::stdin()), crate::shutdown::is_requested)
+    }
+
+    fn spawn_reader<R, F>(mut reader: R, shutdown_requested: F) -> io::Result<Self>
+    where
+        R: BufRead + Send + 'static,
+        F: Fn() -> bool + Send + 'static,
+    {
+        let (sender, receiver) = sync_channel(1);
+        std::thread::Builder::new()
+            .name("br-mcp-stdin".to_string())
+            .spawn(move || {
+                loop {
+                    let mut line = Vec::new();
+                    match reader.read_until(b'\n', &mut line) {
+                        Ok(0) => return,
+                        Ok(_) => {
+                            if sender.send(Ok(line)).is_err() {
+                                return;
+                            }
+                        }
+                        Err(error) => {
+                            let _ = sender.send(Err(error));
+                            return;
+                        }
+                    }
+                }
+            })?;
+
+        Ok(Self {
+            receiver,
+            current_line: Cursor::new(Vec::new()),
+            shutdown_requested: Box::new(shutdown_requested),
+        })
+    }
+}
+
+impl Read for CooperativeStdin {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        if buffer.is_empty() {
+            return Ok(0);
+        }
+
+        loop {
+            if (self.shutdown_requested)() {
+                return Ok(0);
+            }
+
+            let copied = self.current_line.read(buffer)?;
+            if copied != 0 {
+                return Ok(copied);
+            }
+
+            match self.receiver.recv_timeout(MCP_STDIN_SHUTDOWN_POLL) {
+                Ok(Ok(line)) => self.current_line = Cursor::new(line),
+                Ok(Err(error)) => return Err(error),
+                Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => return Ok(0),
+            }
+        }
+    }
+}
 
 /// Map any `Display` error into a flat `McpError::tool_error`.
 ///
@@ -610,9 +693,11 @@ impl BeadsState {
 mod tests {
     use std::cell::Cell;
     use std::fs;
+    use std::io::{Cursor, Read};
     use std::path::PathBuf;
     use std::rc::Rc;
-    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
 
     use chrono::Utc;
     use serde_json::json;
@@ -659,6 +744,33 @@ mod tests {
         state
     }
 
+    #[test]
+    fn cooperative_stdin_forwards_lines_and_eof() {
+        let mut input =
+            CooperativeStdin::spawn_reader(Cursor::new(b"first\nsecond\n".to_vec()), || false)
+                .unwrap();
+        let mut output = String::new();
+
+        input.read_to_string(&mut output).unwrap();
+
+        assert_eq!(output, "first\nsecond\n");
+    }
+
+    #[test]
+    fn cooperative_stdin_reports_eof_after_shutdown_request() {
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let shutdown_for_reader = Arc::clone(&shutdown);
+        let mut input = CooperativeStdin::spawn_reader(
+            Cursor::new(b"request still buffered\n".to_vec()),
+            move || shutdown_for_reader.load(Ordering::Acquire),
+        )
+        .unwrap();
+        shutdown.store(true, Ordering::Release);
+        let mut buffer = [0_u8; 64];
+
+        assert_eq!(input.read(&mut buffer).unwrap(), 0);
+    }
+
     fn install_valid_pending_merge_receipt(
         state: &BeadsState,
     ) -> crate::sync::SyncMergePendingReceipt {
@@ -686,6 +798,7 @@ mod tests {
             kept_issue_witnesses: Vec::new(),
             deleted_issue_ids: Vec::new(),
             note_witnesses: Vec::new(),
+            sequence_numbers: Vec::new(),
             database_before,
         };
         let database_after = crate::sync::capture_sync_merge_core_witness(&storage).unwrap();
@@ -1183,13 +1296,19 @@ pub fn run_serve(args: &ServeArgs, overrides: &config::CliOverrides) -> crate::R
         .lock_timeout
         .or_else(|| config::lock_timeout_from_layer(&merged_layer))
         .or(Some(crate::sync::default_write_lock_timeout_ms()));
-    let write_lock = Arc::new(
-        crate::sync::blocking_database_family_write_lock_with_timeout(
-            &beads_dir,
-            &startup.paths.db_path,
-            lock_timeout,
-        )?,
-    );
+    let write_lock = if let Some(authority) =
+        overrides.database_family_write_authority_for(&beads_dir, &startup.paths.db_path)
+    {
+        Arc::clone(authority)
+    } else {
+        Arc::new(
+            crate::sync::blocking_database_family_write_lock_with_timeout(
+                &beads_dir,
+                &startup.paths.db_path,
+                lock_timeout,
+            )?,
+        )
+    };
     let res = config::open_storage_with_startup_config_under_write_lock(
         startup,
         overrides,
@@ -1271,6 +1390,7 @@ pub fn run_serve(args: &ServeArgs, overrides: &config::CliOverrides) -> crate::R
         .prompt(prompts::PolishBacklogPrompt::new(state))
         .build();
 
-    server.run_transport_returning(StdioTransport::stdio());
+    let stdin = CooperativeStdin::spawn()?;
+    server.run_transport_returning(StdioTransport::new(stdin, io::stdout()));
     Ok(())
 }

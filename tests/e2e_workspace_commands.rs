@@ -7,7 +7,7 @@ mod common;
 
 use common::cli::{BrWorkspace, extract_json_payload, parse_list_issues, run_br, run_br_with_env};
 use fsqlite::Connection;
-use serde_json::Value;
+use serde_json::{Value, json};
 use std::fs;
 
 // ============================================================================
@@ -35,6 +35,67 @@ fn e2e_init_new_workspace() {
     // Verify database file exists
     let db_path = beads_dir.join("beads.db");
     assert!(db_path.exists(), "beads.db should exist");
+}
+
+#[test]
+fn e2e_list_rebuilds_missing_database_from_jsonl() {
+    let _log = common::test_log("e2e_list_rebuilds_missing_database_from_jsonl");
+    let workspace = BrWorkspace::new();
+    let beads_dir = workspace.root.join(".beads");
+    fs::create_dir_all(&beads_dir).expect("create .beads");
+    fs::write(
+        beads_dir.join("config.yaml"),
+        "issue_prefix: rebuilt\nissue-prefix: rebuilt\nsync: {}\n",
+    )
+    .expect("write config");
+    fs::write(
+        beads_dir.join("metadata.json"),
+        "{\n  \"database\": \"beads.db\",\n  \"jsonl_export\": \"issues.jsonl\"\n}\n",
+    )
+    .expect("write metadata");
+    let issue = json!({
+        "id": "rebuilt-abc12",
+        "title": "Imported from JSONL-only checkout",
+        "status": "open",
+        "priority": 1,
+        "issue_type": "task",
+        "created_at": "2026-08-06T00:00:00Z",
+        "created_by": "tester",
+        "updated_at": "2026-08-06T00:00:00Z",
+        "labels": [],
+        "ephemeral": false,
+        "pinned": false,
+        "is_template": false,
+        "dependencies": [],
+        "comments": []
+    });
+    fs::write(beads_dir.join("issues.jsonl"), format!("{issue}\n")).expect("write JSONL");
+
+    let listed = run_br(
+        &workspace,
+        ["list", "--json"],
+        "list_rebuild_missing_database",
+    );
+    assert!(
+        listed.status.success(),
+        "list should rebuild a missing database: stdout='{}' stderr='{}'",
+        listed.stdout,
+        listed.stderr
+    );
+    assert!(
+        !listed.stderr.contains("sync-merge state is unknown"),
+        "missing database must not be misclassified as an unknown pending merge: {}",
+        listed.stderr
+    );
+    assert!(
+        beads_dir.join("beads.db").is_file(),
+        "list auto-import should create the database"
+    );
+    let issues = parse_list_issues(&listed.stdout);
+    assert!(
+        issues.iter().any(|row| row["id"] == "rebuilt-abc12"),
+        "list should include the JSONL issue: {issues:?}"
+    );
 }
 
 #[test]
@@ -840,8 +901,9 @@ fn e2e_doctor_repair_preserves_unflushed_dirty_issues() {
 }
 
 #[test]
-fn e2e_doctor_repair_json_rebuilds_when_db_is_missing() {
-    let _log = common::test_log("e2e_doctor_repair_json_rebuilds_when_db_is_missing");
+fn e2e_doctor_repair_refuses_when_pending_merge_state_is_missing_with_db() {
+    let _log =
+        common::test_log("e2e_doctor_repair_refuses_when_pending_merge_state_is_missing_with_db");
     let workspace = BrWorkspace::new();
 
     let init = run_br(&workspace, ["init"], "init");
@@ -858,39 +920,43 @@ fn e2e_doctor_repair_json_rebuilds_when_db_is_missing() {
         "issues.jsonl should exist before repair test"
     );
 
+    // Retain a nonempty WAL witness: a missing main file with residual
+    // database-family state may hide an interrupted merge saga and must not be
+    // treated like the safe, entirely absent-family JSONL recovery case.
+    let wal_path = std::path::PathBuf::from(format!("{}-wal", db_path.display()));
+    fs::write(&wal_path, b"residual database-family state").expect("plant residual WAL witness");
     fs::remove_file(&db_path).expect("remove beads db");
     assert!(
         !db_path.exists(),
         "database should be missing before repair"
     );
 
-    let repaired = run_br(
+    let refused = run_br(
         &workspace,
         ["doctor", "--repair", "--json"],
         "doctor_repair_missing_db_json",
     );
     assert!(
-        repaired.status.success(),
-        "doctor --repair --json failed for missing db: stdout='{}' stderr='{}'",
-        repaired.stdout,
-        repaired.stderr
+        !refused.status.success(),
+        "doctor --repair must fail closed when the missing database prevents pending-merge inspection"
     );
 
-    let payload = extract_json_payload(&repaired.stdout);
-    let json: Value = serde_json::from_str(&payload).expect("repair doctor json");
-    assert_eq!(json["repaired"], Value::Bool(true));
-    assert_eq!(json["verified"], Value::Bool(true));
-    assert_eq!(json["report"]["ok"], Value::Bool(false));
-    assert_eq!(json["post_repair"]["ok"], Value::Bool(true));
+    let payload = extract_json_payload(&refused.stdout);
+    let json: Value = serde_json::from_str(&payload).expect("repair refusal json");
+    assert_eq!(json["exit_code"], 4);
+    assert_eq!(json["code"], "refused_unsafe");
+    assert_eq!(json["gate"], "sync.merge_pending");
+    assert_eq!(json["evidence"]["pending"], "unknown");
     assert!(
-        db_path.exists(),
-        "doctor repair should recreate the database from JSONL"
+        !db_path.exists(),
+        "refused repair must not recreate the database"
     );
 }
 
 #[test]
-fn e2e_doctor_repair_json_rebuilds_when_db_is_malformed() {
-    let _log = common::test_log("e2e_doctor_repair_json_rebuilds_when_db_is_malformed");
+fn e2e_doctor_repair_refuses_when_malformed_db_hides_pending_merge_state() {
+    let _log =
+        common::test_log("e2e_doctor_repair_refuses_when_malformed_db_hides_pending_merge_state");
     let workspace = BrWorkspace::new();
 
     let init = run_br(&workspace, ["init"], "init");
@@ -913,39 +979,26 @@ fn e2e_doctor_repair_json_rebuilds_when_db_is_malformed() {
 
     fs::write(&db_path, b"not a sqlite database").expect("corrupt beads db");
 
-    let repaired = run_br(
+    let refused = run_br(
         &workspace,
         ["doctor", "--repair", "--json"],
         "doctor_repair_malformed_db_json",
     );
     assert!(
-        repaired.status.success(),
-        "doctor --repair --json failed for malformed db: stdout='{}' stderr='{}'",
-        repaired.stdout,
-        repaired.stderr
+        !refused.status.success(),
+        "doctor --repair must fail closed when a malformed database prevents pending-merge inspection"
     );
 
-    let payload = extract_json_payload(&repaired.stdout);
-    let json: Value = serde_json::from_str(&payload).expect("repair doctor json");
-    assert_eq!(json["repaired"], Value::Bool(true));
-    assert_eq!(json["verified"], Value::Bool(true));
-    assert_eq!(json["report"]["ok"], Value::Bool(false));
-    assert_eq!(json["post_repair"]["ok"], Value::Bool(true));
-
-    let show = run_br(
-        &workspace,
-        ["list", "--json"],
-        "list_after_malformed_repair",
-    );
-    assert!(
-        show.status.success(),
-        "list should succeed after malformed-db repair: {}",
-        show.stderr
-    );
-    let listed = parse_list_issues(&show.stdout);
-    assert!(
-        !listed.is_empty(),
-        "expected repaired database to contain at least one issue: {listed:?}"
+    let payload = extract_json_payload(&refused.stdout);
+    let json: Value = serde_json::from_str(&payload).expect("repair refusal json");
+    assert_eq!(json["exit_code"], 4);
+    assert_eq!(json["code"], "refused_unsafe");
+    assert_eq!(json["gate"], "sync.merge_pending");
+    assert_eq!(json["evidence"]["pending"], "unknown");
+    assert_eq!(
+        fs::read(&db_path).expect("read refused malformed database"),
+        b"not a sqlite database",
+        "refused repair must not replace the malformed database"
     );
 }
 

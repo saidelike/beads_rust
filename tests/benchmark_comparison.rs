@@ -16,6 +16,7 @@ mod common;
 
 use assert_cmd::Command;
 use chrono::Utc;
+use common::cli::isolated_temp_root;
 use common::init_test_logging;
 use serde::{Deserialize, Serialize};
 use std::ffi::OsStr;
@@ -60,7 +61,7 @@ pub struct BenchmarkWorkspace {
 
 impl BenchmarkWorkspace {
     pub fn new() -> Self {
-        let temp_dir = TempDir::new().expect("create temp dir");
+        let temp_dir = TempDir::new_in(isolated_temp_root()).expect("create isolated temp dir");
         let root = temp_dir.path().to_path_buf();
         let br_root = root.join("br_workspace");
         let bd_root = root.join("bd_workspace");

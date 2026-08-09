@@ -8,7 +8,10 @@
 //!   INSTA_UPDATE=always cargo test --test golden_beads_init
 //!   cargo insta review
 
+mod common;
+
 use assert_cmd::Command;
+use common::cli::isolated_temp_root;
 use insta::assert_snapshot;
 use std::fmt::Write;
 use std::fs;
@@ -20,7 +23,7 @@ fn br_cmd() -> Command {
 }
 
 fn init_fresh_workspace() -> TempDir {
-    let dir = TempDir::new().expect("temp dir");
+    let dir = TempDir::new_in(isolated_temp_root()).expect("isolated temp dir");
     let mut cmd = br_cmd();
     cmd.current_dir(dir.path());
     cmd.args(["init", "--prefix", "bd"]);

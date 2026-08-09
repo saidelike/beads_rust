@@ -184,5 +184,3 @@ The current br implementation is fundamentally safe because:
 The remaining risk is the `BEADS_JSONL` environment variable escape hatch, which should be hardened with additional validation or require explicit opt-in.
 
 ---
-
-*Analysis performed by PurpleFox (claude-opus-4-5-20251101) on 2026-01-16*

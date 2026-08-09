@@ -769,8 +769,13 @@ fn e2e_non_hermetic_smoke_existing_workspace_preserves_env_sensitive_paths() {
     fs::create_dir_all(&runner_root).expect("create smoke runner root");
 
     let external_beads_dir = fixture.root.join(".beads");
+    let custom_db = external_beads_dir.join("custom.db");
+    drop(
+        SqliteStorage::open(&custom_db)
+            .expect("migrate isolated metadata_custom_paths fixture to the runtime schema"),
+    );
     let external_beads_dir_str = external_beads_dir.display().to_string();
-    let custom_db_str = external_beads_dir.join("custom.db").display().to_string();
+    let custom_db_str = custom_db.display().to_string();
     let custom_jsonl_str = external_beads_dir
         .join("custom.jsonl")
         .display()
@@ -1440,6 +1445,9 @@ fn e2e_sync_force_jsonl_merge_does_not_resurrect_local_tombstone() {
 
 #[cfg(target_os = "linux")]
 #[test]
+// Resume must reuse one receipt and cutoff across the complete interrupted
+// merge lifecycle, so this contract intentionally remains a single scenario.
+#[allow(clippy::too_many_lines)]
 fn e2e_sync_merge_resume_reuses_receipt_tombstone_cutoff() {
     let _log = common::test_log("e2e_sync_merge_resume_reuses_receipt_tombstone_cutoff");
     let workspace = BrWorkspace::new();
@@ -1611,9 +1619,12 @@ fn e2e_sync_merge_resume_reuses_receipt_tombstone_cutoff() {
             .split(|byte| *byte == b'\n')
             .filter(|line| !line.is_empty())
             .count(),
-        committed_receipt["jsonl_after_issue_count"]
-            .as_u64()
-            .expect("receipt issue count") as usize
+        usize::try_from(
+            committed_receipt["jsonl_after_issue_count"]
+                .as_u64()
+                .expect("receipt issue count"),
+        )
+        .expect("receipt issue count fits usize")
     );
     let reviewed_digest = Sha256::digest(&receipt_reviewed_bytes);
     assert_eq!(
@@ -1667,6 +1678,9 @@ fn e2e_sync_merge_resume_reuses_receipt_tombstone_cutoff() {
 
 #[cfg(target_os = "linux")]
 #[test]
+// All file-only mutation surfaces share one pending-receipt witness set so a
+// refusal cannot hide a mutation between independently initialized fixtures.
+#[allow(clippy::too_many_lines)]
 fn e2e_pending_merge_gate_refuses_file_only_mutations_without_changing_witnesses() {
     let _log = common::test_log(
         "e2e_pending_merge_gate_refuses_file_only_mutations_without_changing_witnesses",
@@ -1945,6 +1959,9 @@ fn e2e_pending_merge_gate_refuses_file_only_mutations_without_changing_witnesses
 
 #[cfg(target_os = "linux")]
 #[test]
+// Warning persistence is asserted through interruption, resume, and both
+// output modes in one causally connected workspace.
+#[allow(clippy::too_many_lines)]
 fn e2e_sync_merge_capacity_warning_survives_receipt_resume_and_renders_human() {
     let _log = common::test_log(
         "e2e_sync_merge_capacity_warning_survives_receipt_resume_and_renders_human",
@@ -2347,9 +2364,9 @@ fn e2e_no_db_sync_jsonl_rewriters_lock_before_loading_the_snapshot() {
             run.stderr
         );
         assert!(
-            run.stderr.contains("JSONL-family write lock")
-                || run.stderr.contains("JSONL-family write authority"),
-            "the JSONL authority must fail before malformed snapshot parsing: {}",
+            run.stderr
+                .contains("waiting for write lock at <database-authority sha256="),
+            "the database-family authority must fail before malformed snapshot parsing: {}",
             run.stderr
         );
         assert!(
@@ -2798,6 +2815,9 @@ fn e2e_sync_status_json() {
 }
 
 #[test]
+// Read-only planning, lossless apply, and idempotent replay must share the same
+// reconciliation plan and witnesses across this end-to-end lifecycle.
+#[allow(clippy::too_many_lines)]
 fn e2e_sync_additive_reconciliation_is_read_only_then_lossless_and_idempotent() {
     let workspace = BrWorkspace::new();
     let init = run_br(&workspace, ["init"], "init_additive_reconciliation");
@@ -2805,30 +2825,28 @@ fn e2e_sync_additive_reconciliation_is_read_only_then_lossless_and_idempotent() 
 
     let create = run_br(
         &workspace,
-        [
-            "create",
-            "Database audit seed",
-            "--id",
-            "bd-db-seed",
-            "--no-auto-flush",
-        ],
+        ["create", "Database audit seed", "--no-auto-flush"],
         "create_additive_database_seed",
     );
     assert_br_success(&create, "create additive database seed");
+    let database_seed_id = parse_created_id(&create.stdout);
+    assert!(
+        !database_seed_id.is_empty(),
+        "additive database seed must report its generated ID"
+    );
     let create_db_only = run_br(
         &workspace,
-        [
-            "create",
-            "Database-only preserved row",
-            "--id",
-            "bd-db-only",
-            "--no-auto-flush",
-        ],
+        ["create", "Database-only preserved row", "--no-auto-flush"],
         "create_additive_database_only_row",
     );
     assert_br_success(
         &create_db_only,
         "create additive database-only preserved row",
+    );
+    let database_only_id = parse_created_id(&create_db_only.stdout);
+    assert!(
+        !database_only_id.is_empty(),
+        "additive database-only row must report its generated ID"
     );
 
     let beads_dir = workspace.root.join(".beads");
@@ -2836,7 +2854,7 @@ fn e2e_sync_additive_reconciliation_is_read_only_then_lossless_and_idempotent() 
     let jsonl_path = beads_dir.join("issues.jsonl");
     let storage = SqliteStorage::open(&db_path).expect("open additive database before plan");
     let database_seed = storage
-        .get_issue("bd-db-seed")
+        .get_issue(&database_seed_id)
         .expect("read database seed")
         .expect("database seed exists");
     let events_before = storage.get_all_events(0).expect("read events before plan");
@@ -2882,7 +2900,7 @@ fn e2e_sync_additive_reconciliation_is_read_only_then_lossless_and_idempotent() 
     );
     let plan_json: Value = serde_json::from_str(&extract_json_payload(&plan.stdout))
         .expect("parse additive dry-run receipt");
-    assert_eq!(plan_json["schema"], "br.sync.additive-reconciliation.v2");
+    assert_eq!(plan_json["schema"], "br.sync.additive-reconciliation.v3");
     assert_eq!(plan_json["status"], "ready");
     assert_eq!(plan_json["source_issues"].as_u64(), Some(2));
     assert_eq!(plan_json["created"].as_u64(), Some(1));
@@ -3024,14 +3042,14 @@ fn e2e_sync_additive_reconciliation_is_read_only_then_lossless_and_idempotent() 
     );
     assert!(
         storage
-            .get_issue("bd-db-seed")
+            .get_issue(&database_seed_id)
             .expect("read preserved database seed")
             .is_some(),
         "pre-existing database issue must be preserved"
     );
     assert!(
         storage
-            .get_issue("bd-db-only")
+            .get_issue(&database_only_id)
             .expect("read database-only issue")
             .is_some(),
         "database-only issue must be preserved"

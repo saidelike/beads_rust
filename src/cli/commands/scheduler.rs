@@ -339,17 +339,14 @@ fn load_scheduler_relation_metadata(
     storage: &SqliteStorage,
     issue_ids: &[String],
 ) -> Result<SchedulerRelationMetadata> {
-    if issue_ids.len() >= SCHEDULER_FULL_METADATA_THRESHOLD {
+    let labels_by_issue = if issue_ids.len() >= SCHEDULER_FULL_METADATA_THRESHOLD {
         let relation_metadata = storage.get_all_list_relation_metadata()?;
-        return Ok(project_scheduler_relation_metadata(
-            issue_ids,
-            &relation_metadata,
-        ));
-    }
-
-    let labels_by_issue = storage.get_labels_for_issues(issue_ids)?;
+        project_scheduler_relation_metadata(issue_ids, &relation_metadata).0
+    } else {
+        storage.get_labels_for_issues(issue_ids)?
+    };
     let (dependency_counts, dependent_counts) =
-        storage.count_relation_counts_for_issues(issue_ids)?;
+        storage.count_scheduler_relation_counts_for_issues(issue_ids)?;
     Ok((labels_by_issue, dependency_counts, dependent_counts))
 }
 

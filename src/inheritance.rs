@@ -21,10 +21,12 @@
 //! without committing config changes.
 //!
 //! v1 emits the **two bookends** of the ancestor chain — the immediate
-//! parent and the root ancestor (preferring the topmost `epic` if one
-//! exists, otherwise the chain's terminal). Intermediate layers are
-//! skipped; if parent == root, only one block is emitted. Cycles in
-//! the parent chain stop traversal and log to stderr; tombstoned and
+//! parent and the strategic root ancestor. Projects with configured type
+//! capabilities prefer the nearest ancestor marked `inherited_context_root`;
+//! projects without type policy preserve the topmost-Epic behavior. Both
+//! modes otherwise fall back to the chain's terminal ancestor. Intermediate
+//! layers are skipped; if parent == root, only one block is emitted. Cycles
+//! in the parent chain stop traversal and log to stderr; tombstoned and
 //! missing ancestors are silently skipped.
 
 use std::collections::HashSet;
@@ -158,12 +160,16 @@ pub fn collect_inherited_blocks(
     // the root block already carries the "epic" label so the parent
     // block correctly stays "parent".
     let parent_is_also_root = root.as_ref().is_some_and(|r| r.id == immediate_parent.id);
-    let parent_role =
-        if parent_is_also_root && matches!(immediate_parent.issue_type, IssueType::Epic) {
-            "epic"
-        } else {
-            "parent"
-        };
+    let parent_role = if parent_is_also_root
+        && storage
+            .issue_type_registry()
+            .capabilities_for_name(immediate_parent.issue_type.as_str())
+            .inherited_context_root
+    {
+        root_role(&immediate_parent)
+    } else {
+        "parent"
+    };
 
     if !emitted_ids.contains(&immediate_parent.id)
         && let Some(block) = block_from_ancestor(&immediate_parent, parent_role)
@@ -218,9 +224,19 @@ fn walk_to_root(
     visited: &mut HashSet<String>,
 ) -> Result<Option<Issue>> {
     let mut current = start.clone();
-    // Track the most-recent epic we've seen, so we can prefer
-    // `epic`-type ancestors over the chain's terminal when both are
-    // available.
+    let prefer_configured_root = !storage.issue_type_registry().is_builtin_only();
+    // Configured roots use nearest-ancestor semantics. The built-in-only
+    // branch retains the historical topmost-Epic behavior exactly.
+    let mut nearest_configured_root: Option<Issue> = if prefer_configured_root
+        && storage
+            .issue_type_registry()
+            .capabilities_for_name(current.issue_type.as_str())
+            .inherited_context_root
+    {
+        Some(current.clone())
+    } else {
+        None
+    };
     let mut latest_epic: Option<Issue> = if matches!(current.issue_type, IssueType::Epic) {
         Some(current.clone())
     } else {
@@ -247,13 +263,25 @@ fn walk_to_root(
         if matches!(parent.issue_type, IssueType::Epic) {
             latest_epic = Some(parent.clone());
         }
+        if prefer_configured_root
+            && nearest_configured_root.is_none()
+            && storage
+                .issue_type_registry()
+                .capabilities_for_name(parent.issue_type.as_str())
+                .inherited_context_root
+        {
+            nearest_configured_root = Some(parent.clone());
+        }
         current = parent;
     }
 
-    // Prefer the topmost epic (if any) over the chain's terminal
-    // ancestor. Per spec: "if no ancestor has type epic, br uses the
-    // chain's terminal ancestor".
-    Ok(latest_epic.or(Some(current)))
+    if prefer_configured_root {
+        Ok(nearest_configured_root.or(Some(current)))
+    } else {
+        // Historical behavior: prefer the topmost Epic (if any) over the
+        // chain's terminal ancestor.
+        Ok(latest_epic.or(Some(current)))
+    }
 }
 
 fn load_active_issue(storage: &SqliteStorage, id: &str) -> Result<Option<Issue>> {
@@ -308,6 +336,84 @@ pub fn render_text(blocks: &[InheritedBlock]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::{Dependency, DependencyType, Priority, Status};
+    use chrono::Utc;
+
+    fn test_issue(id: &str, issue_type: IssueType, agent_context: Option<&str>) -> Issue {
+        let now = Utc::now();
+        Issue {
+            id: id.to_string(),
+            content_hash: None,
+            title: id.to_string(),
+            description: None,
+            design: None,
+            acceptance_criteria: None,
+            notes: None,
+            status: Status::Open,
+            priority: Priority::MEDIUM,
+            issue_type,
+            assignee: None,
+            owner: None,
+            estimated_minutes: None,
+            created_at: now,
+            created_by: None,
+            updated_at: now,
+            closed_at: None,
+            close_reason: None,
+            closed_by_session: None,
+            due_at: None,
+            defer_until: None,
+            external_ref: None,
+            source_system: None,
+            source_repo: None,
+            source_repo_path: None,
+            agent_context: agent_context.map(str::to_string),
+            deleted_at: None,
+            deleted_by: None,
+            delete_reason: None,
+            original_type: None,
+            compaction_level: None,
+            compacted_at: None,
+            compacted_at_commit: None,
+            original_size: None,
+            sender: None,
+            ephemeral: false,
+            pinned: false,
+            is_template: false,
+            labels: Vec::new(),
+            dependencies: Vec::new(),
+            comments: Vec::new(),
+        }
+    }
+
+    fn parent_dependency(child: &str, parent: &str) -> Dependency {
+        Dependency {
+            issue_id: child.to_string(),
+            depends_on_id: parent.to_string(),
+            dep_type: DependencyType::ParentChild,
+            created_at: Utc::now(),
+            created_by: Some("tester".to_string()),
+            metadata: None,
+            thread_id: None,
+        }
+    }
+
+    fn install_map_context_root(storage: &mut SqliteStorage) {
+        let policy = crate::close_policy::IssueTypePolicy {
+            types: vec![crate::close_policy::IssueTypeDefinition {
+                name: "map".to_string(),
+                capabilities: crate::close_policy::IssueTypeCapabilityOverrides {
+                    inherited_context_root: Some(true),
+                    ..Default::default()
+                },
+                roadmap_role: None,
+            }],
+            ..Default::default()
+        };
+        storage.set_issue_type_registry(
+            crate::close_policy::TypeCapabilityRegistry::resolve(&policy).unwrap(),
+        );
+    }
 
     #[test]
     fn render_text_emits_empty_string_for_no_blocks() {
@@ -397,5 +503,110 @@ mod tests {
         // Malformed YAML => disabled (don't fail the show on bad config).
         std::fs::write(&cfg, "this: is: not: yaml: [").expect("write malformed");
         assert!(!is_enabled_from_inputs(None, &cfg));
+    }
+
+    #[test]
+    fn configured_context_root_prefers_nearest_ancestor_and_stops_on_cycle() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        install_map_context_root(&mut storage);
+        for issue in [
+            test_issue(
+                "bd-outer",
+                IssueType::Custom("map".to_string()),
+                Some("outer context"),
+            ),
+            test_issue(
+                "bd-inner",
+                IssueType::Custom("map".to_string()),
+                Some("inner context"),
+            ),
+            test_issue("bd-leaf", IssueType::Task, None),
+        ] {
+            storage.create_issue(&issue, "tester").unwrap();
+        }
+        storage
+            .sync_dependencies_for_import("bd-leaf", &[parent_dependency("bd-leaf", "bd-inner")])
+            .unwrap();
+        storage
+            .sync_dependencies_for_import("bd-inner", &[parent_dependency("bd-inner", "bd-outer")])
+            .unwrap();
+        storage
+            .sync_dependencies_for_import("bd-outer", &[parent_dependency("bd-outer", "bd-inner")])
+            .unwrap();
+
+        let blocks = collect_inherited_blocks(&storage, "bd-leaf").unwrap();
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].source_id, "bd-inner");
+        assert_eq!(blocks[0].source_role, "root");
+        assert_eq!(blocks[0].content, "inner context");
+    }
+
+    #[test]
+    fn missing_parent_is_silently_ignored() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        storage
+            .create_issue(&test_issue("bd-orphan", IssueType::Task, None), "tester")
+            .unwrap();
+        storage
+            .sync_dependencies_for_import(
+                "bd-orphan",
+                &[parent_dependency("bd-orphan", "bd-missing")],
+            )
+            .unwrap();
+        assert!(
+            collect_inherited_blocks(&storage, "bd-orphan")
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn builtin_only_registry_preserves_topmost_epic_preference() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        for issue in [
+            test_issue("bd-outer", IssueType::Epic, Some("outer epic")),
+            test_issue("bd-inner", IssueType::Epic, Some("inner epic")),
+            test_issue("bd-leaf", IssueType::Task, None),
+        ] {
+            storage.create_issue(&issue, "tester").unwrap();
+        }
+        storage
+            .add_dependency("bd-inner", "bd-outer", "parent-child", "tester")
+            .unwrap();
+        storage
+            .add_dependency("bd-leaf", "bd-inner", "parent-child", "tester")
+            .unwrap();
+
+        let blocks = collect_inherited_blocks(&storage, "bd-leaf").unwrap();
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0].source_id, "bd-outer");
+        assert_eq!(blocks[0].source_role, "epic");
+        assert_eq!(blocks[1].source_id, "bd-inner");
+        assert_eq!(blocks[1].source_role, "parent");
+    }
+
+    #[test]
+    fn configured_registry_without_preferred_root_falls_back_to_terminal_ancestor() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        install_map_context_root(&mut storage);
+        for issue in [
+            test_issue("bd-root", IssueType::Task, Some("terminal context")),
+            test_issue("bd-middle", IssueType::Task, None),
+            test_issue("bd-leaf", IssueType::Task, None),
+        ] {
+            storage.create_issue(&issue, "tester").unwrap();
+        }
+        storage
+            .add_dependency("bd-middle", "bd-root", "parent-child", "tester")
+            .unwrap();
+        storage
+            .add_dependency("bd-leaf", "bd-middle", "parent-child", "tester")
+            .unwrap();
+
+        let blocks = collect_inherited_blocks(&storage, "bd-leaf").unwrap();
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].source_id, "bd-root");
+        assert_eq!(blocks[0].source_role, "root");
+        assert_eq!(blocks[0].content, "terminal context");
     }
 }

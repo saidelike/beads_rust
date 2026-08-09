@@ -1,7 +1,55 @@
 mod common;
 
-use common::cli::{BrWorkspace, extract_json_payload, run_br};
+use common::cli::{BrWorkspace, extract_json_payload, run_br, run_br_with_env};
 use serde_json::Value;
+use std::fs;
+
+#[test]
+fn retired_type_command_is_absent_from_the_public_cli() {
+    let _log = common::test_log("retired_type_command_is_absent_from_the_public_cli");
+    let workspace = BrWorkspace::new();
+    assert!(run_br(&workspace, ["init"], "init").status.success());
+
+    let help = run_br(&workspace, ["--help"], "top_level_help");
+    assert!(help.status.success(), "{}", help.stderr);
+    assert!(!help.stdout.contains("\n  type "), "{}", help.stdout);
+
+    let retired = run_br(&workspace, ["type", "status", "epic"], "retired_type");
+    assert!(!retired.status.success(), "{}", retired.stdout);
+    assert!(retired.stderr.contains("unrecognized subcommand 'type'"));
+
+    let capabilities = run_br(
+        &workspace,
+        ["capabilities", "--format", "json"],
+        "capabilities_without_type",
+    );
+    assert!(capabilities.status.success(), "{}", capabilities.stderr);
+    let capabilities: Value = serde_json::from_str(&extract_json_payload(&capabilities.stdout))
+        .expect("capabilities JSON");
+    assert!(
+        capabilities["commands"]
+            .as_array()
+            .expect("command contracts")
+            .iter()
+            .all(|command| !command["name"]
+                .as_str()
+                .is_some_and(|name| name.starts_with("type ")))
+    );
+    assert!(
+        capabilities["issue_types"]["types"]["epic"]["capabilities"]
+            .get("close_eligible_from_terminal_children")
+            .is_none()
+    );
+
+    let schema = run_br(
+        &workspace,
+        ["schema", "all", "--format", "json"],
+        "schema_without_type",
+    );
+    assert!(schema.status.success(), "{}", schema.stderr);
+    assert!(!schema.stdout.contains("IssueTypeStatus"));
+    assert!(!schema.stdout.contains("type close-eligible"));
+}
 
 fn parse_created_id(stdout: &str) -> String {
     let line = stdout.lines().next().unwrap_or("");
@@ -12,6 +60,234 @@ fn parse_created_id(stdout: &str) -> String {
         .and_then(|rest| rest.split(':').next())
         .unwrap_or("");
     id_part.trim().to_string()
+}
+
+#[test]
+// This end-to-end contract intentionally keeps the complete Matt workflow in
+// one workspace so IDs and state transitions remain causally connected.
+#[allow(clippy::too_many_lines)]
+fn e2e_matt_skills_profile_complete_public_workflow() {
+    let _log = common::test_log("e2e_matt_skills_profile_complete_public_workflow");
+    let workspace = BrWorkspace::new();
+    let init = run_br(&workspace, ["init"], "init_matt_profile");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+    fs::write(
+        workspace.root.join(".beads").join("policy.yaml"),
+        "issue_types:\n  profiles: [matt-skills]\n  types:\n    - name: local-review\n      capabilities:\n        aggregate: true\n        ready_work: false\n",
+    )
+    .expect("write Matt-skills policy");
+
+    let create = |title: &str, issue_type: &str, label: &str| {
+        let output = run_br(&workspace, ["create", title, "--type", issue_type], label);
+        assert!(output.status.success(), "create failed: {}", output.stderr);
+        parse_created_id(&output.stdout)
+    };
+    let map_id = create("Wayfinder map", "map", "create_profile_map");
+    let research_id = create("Research outcome", "research", "create_profile_research");
+    let prerequisite_id = create("Manual prerequisite", "task", "create_profile_task");
+    let spec_id = create("Published specification", "spec", "create_profile_spec");
+    let implementation_id = create(
+        "Implementation slice",
+        "implementation",
+        "create_profile_implementation",
+    );
+    let bug_id = create("Discovered defect", "bug", "create_profile_bug");
+
+    let context = run_br(
+        &workspace,
+        [
+            "update",
+            &map_id,
+            "--agent-context",
+            r#"{"strategy":"follow the published Map"}"#,
+            "--add-label",
+            "ready-for-human",
+        ],
+        "configure_profile_map",
+    );
+    assert!(
+        context.status.success(),
+        "map update failed: {}",
+        context.stderr
+    );
+    let route_research = run_br(
+        &workspace,
+        ["update", &research_id, "--add-label", "ready-for-agent"],
+        "route_profile_research",
+    );
+    assert!(route_research.status.success());
+
+    for (child, parent, dep_type, label) in [
+        (
+            &research_id,
+            &map_id,
+            "parent-child",
+            "parent_profile_research",
+        ),
+        (&spec_id, &map_id, "parent-child", "parent_profile_spec"),
+        (
+            &implementation_id,
+            &spec_id,
+            "parent-child",
+            "parent_profile_implementation",
+        ),
+        (&bug_id, &spec_id, "parent-child", "parent_profile_bug"),
+        (
+            &research_id,
+            &prerequisite_id,
+            "blocks",
+            "block_profile_research",
+        ),
+    ] {
+        let dep = run_br(
+            &workspace,
+            ["dep", "add", child, parent, "--type", dep_type],
+            label,
+        );
+        assert!(dep.status.success(), "dep add failed: {}", dep.stderr);
+    }
+
+    let capabilities = run_br(
+        &workspace,
+        ["capabilities", "--format", "json"],
+        "profile_capabilities",
+    );
+    assert!(
+        capabilities.status.success(),
+        "capabilities failed: {}",
+        capabilities.stderr
+    );
+    let capabilities: Value = serde_json::from_str(&extract_json_payload(&capabilities.stdout))
+        .expect("capabilities JSON");
+    assert_eq!(capabilities["contract_version"], "br.capabilities.v1");
+    assert_eq!(
+        capabilities["issue_types"]["standard_types"],
+        serde_json::json!([
+            "task", "bug", "feature", "epic", "chore", "docs", "question"
+        ])
+    );
+    assert_eq!(capabilities["issue_types"]["accepts_custom_types"], true);
+    assert_eq!(
+        capabilities["issue_types"]["active_profiles"][0],
+        "matt-skills"
+    );
+    for issue_type in [
+        "map",
+        "research",
+        "grilling",
+        "prototype",
+        "spec",
+        "implementation",
+        "local-review",
+    ] {
+        assert!(
+            capabilities["issue_types"]["types"][issue_type].is_object(),
+            "missing effective type {issue_type}: {capabilities}"
+        );
+    }
+    assert_eq!(
+        capabilities["issue_types"]["types"]["map"]["capabilities"]["ready_work"],
+        false
+    );
+    assert!(
+        capabilities["issue_types"]["types"].get("task").is_none(),
+        "accepted neutral standard types are not registrations"
+    );
+    assert_eq!(
+        capabilities["issue_types"]["types"]["spec"]["source"],
+        "profile:matt-skills"
+    );
+
+    let ready = run_br(&workspace, ["ready", "--json"], "profile_ready_initial");
+    let ready: Vec<Value> =
+        serde_json::from_str(&extract_json_payload(&ready.stdout)).expect("ready JSON");
+    assert!(!ready.iter().any(|issue| issue["id"] == map_id));
+    assert!(!ready.iter().any(|issue| issue["id"] == research_id));
+    assert!(ready.iter().any(|issue| issue["id"] == prerequisite_id));
+
+    let blocked = run_br(&workspace, ["blocked", "--json"], "profile_blocked_initial");
+    let blocked: Vec<Value> =
+        serde_json::from_str(&extract_json_payload(&blocked.stdout)).expect("blocked JSON");
+    assert!(blocked.iter().any(|issue| issue["id"] == research_id));
+    assert!(!blocked.iter().any(|issue| issue["id"] == map_id));
+
+    assert!(
+        run_br(
+            &workspace,
+            ["close", &prerequisite_id, "--force"],
+            "close_profile_prerequisite"
+        )
+        .status
+        .success()
+    );
+    let ready = run_br(&workspace, ["ready", "--json"], "profile_ready_research");
+    let ready: Vec<Value> =
+        serde_json::from_str(&extract_json_payload(&ready.stdout)).expect("ready JSON");
+    assert!(ready.iter().any(|issue| issue["id"] == research_id));
+
+    let publish_spec = run_br(&workspace, ["close", &spec_id], "publish_profile_spec");
+    assert!(
+        publish_spec.status.success(),
+        "Spec publication failed: {}",
+        publish_spec.stderr
+    );
+    assert!(
+        run_br(
+            &workspace,
+            ["close", &research_id, "--force"],
+            "close_profile_research"
+        )
+        .status
+        .success()
+    );
+
+    let inherited = run_br_with_env(
+        &workspace,
+        ["show", &implementation_id],
+        [("BR_INHERITED_CONTEXT", "1")],
+        "profile_inherited_context",
+    );
+    assert!(
+        inherited.status.success(),
+        "show failed: {}",
+        inherited.stderr
+    );
+    assert!(
+        inherited.stdout.contains("follow the published Map"),
+        "{}",
+        inherited.stdout
+    );
+
+    let ready = run_br(&workspace, ["ready", "--json"], "profile_ready_delivery");
+    let ready: Vec<Value> =
+        serde_json::from_str(&extract_json_payload(&ready.stdout)).expect("ready JSON");
+    assert!(ready.iter().any(|issue| issue["id"] == implementation_id));
+    assert!(ready.iter().any(|issue| issue["id"] == bug_id));
+
+    let flush = run_br(
+        &workspace,
+        ["sync", "--flush-only", "--json"],
+        "profile_sync_flush",
+    );
+    assert!(
+        flush.status.success(),
+        "sync flush failed: {}",
+        flush.stderr
+    );
+    let jsonl = fs::read_to_string(workspace.root.join(".beads").join("issues.jsonl"))
+        .expect("read exported JSONL");
+    assert!(jsonl.contains(r#""issue_type":"map""#));
+    assert!(jsonl.contains(r#""issue_type":"implementation""#));
+    let import = run_br(
+        &workspace,
+        ["sync", "--import-only", "--force", "--json"],
+        "profile_sync_import",
+    );
+    assert!(
+        import.status.success(),
+        "sync import failed: {}",
+        import.stderr
+    );
 }
 
 // ============================================================================

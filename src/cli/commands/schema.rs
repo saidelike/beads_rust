@@ -12,10 +12,12 @@
 //! reading source code. The CLI surface marks `br schema` as
 //! not-yet-stable; agents should re-call across release boundaries.
 
+use crate::cli::commands::roadmap::RoadmapOutput;
 use crate::cli::commands::vcs::VcsExportStatus;
 use crate::cli::{
     OutputFormat, SchemaArgs, SchemaTarget, resolve_output_format_basic_with_outer_mode,
 };
+use crate::close_policy::TypeCapabilityRegistry;
 use crate::coordination::{CoordinationClaimRow, CoordinationStatusOutput};
 use crate::error::Result;
 use crate::format::{
@@ -23,6 +25,7 @@ use crate::format::{
 };
 use crate::model::Issue;
 use crate::output::{OutputContext, OutputMode};
+use crate::redirect::RedirectReceipt;
 use crate::sync::AdditiveReconcileReceipt;
 use crate::{config, output};
 use chrono::{DateTime, Utc};
@@ -188,33 +191,7 @@ fn build_schemas(target: SchemaTarget) -> BTreeMap<&'static str, Schema> {
 
     match target {
         SchemaTarget::All => {
-            schemas.insert("Issue", schema_for_output::<Issue>());
-            schemas.insert("IssueWithCounts", schema_for_output::<IssueWithCounts>());
-            schemas.insert("IssueDetails", schema_for_output::<IssueDetails>());
-            schemas.insert("ReadyIssue", schema_for_output::<ReadyIssue>());
-            schemas.insert("StaleIssue", schema_for_output::<StaleIssue>());
-            schemas.insert("BlockedIssue", schema_for_output::<BlockedIssueOutput>());
-            schemas.insert("TreeNode", schema_for_output::<TreeNode>());
-            schemas.insert("CountGroup", schema_for_output::<CountGroup>());
-            schemas.insert("Statistics", schema_for_output::<Statistics>());
-            schemas.insert(
-                "CoordinationStatusOutput",
-                schema_for_output::<CoordinationStatusOutput>(),
-            );
-            schemas.insert(
-                "CoordinationClaimRow",
-                schema_for_output::<CoordinationClaimRow>(),
-            );
-            schemas.insert(
-                "SyncReconcileReceipt",
-                schema_for_output::<crate::cli::commands::sync::SyncReconcileReceipt>(),
-            );
-            schemas.insert(
-                "AdditiveReconcileReceipt",
-                schema_for_output::<AdditiveReconcileReceipt>(),
-            );
-            schemas.insert("VcsExportStatus", schema_for_output::<VcsExportStatus>());
-            schemas.insert("ErrorEnvelope", schema_for_output::<ErrorEnvelope>());
+            insert_all_schemas(&mut schemas);
         }
         SchemaTarget::Issue => {
             schemas.insert("Issue", schema_for_output::<Issue>());
@@ -237,6 +214,9 @@ fn build_schemas(target: SchemaTarget) -> BTreeMap<&'static str, Schema> {
         SchemaTarget::TreeNode => {
             schemas.insert("TreeNode", schema_for_output::<TreeNode>());
         }
+        SchemaTarget::Roadmap => {
+            schemas.insert("Roadmap", schema_for_output::<RoadmapOutput>());
+        }
         SchemaTarget::Statistics => {
             schemas.insert("Statistics", schema_for_output::<Statistics>());
         }
@@ -250,6 +230,12 @@ fn build_schemas(target: SchemaTarget) -> BTreeMap<&'static str, Schema> {
                 schema_for_output::<CoordinationClaimRow>(),
             );
         }
+        SchemaTarget::IssueTypeCapabilities => {
+            schemas.insert(
+                "TypeCapabilityRegistry",
+                schema_for_output::<TypeCapabilityRegistry>(),
+            );
+        }
         SchemaTarget::AdditiveReconciliation => {
             schemas.insert(
                 "AdditiveReconcileReceipt",
@@ -258,6 +244,9 @@ fn build_schemas(target: SchemaTarget) -> BTreeMap<&'static str, Schema> {
         }
         SchemaTarget::VcsStatus => {
             schemas.insert("VcsExportStatus", schema_for_output::<VcsExportStatus>());
+        }
+        SchemaTarget::RedirectReceipt => {
+            schemas.insert("RedirectReceipt", schema_for_output::<RedirectReceipt>());
         }
         SchemaTarget::Error => {
             schemas.insert("ErrorEnvelope", schema_for_output::<ErrorEnvelope>());
@@ -268,6 +257,42 @@ fn build_schemas(target: SchemaTarget) -> BTreeMap<&'static str, Schema> {
     }
 
     schemas
+}
+
+fn insert_all_schemas(schemas: &mut BTreeMap<&'static str, Schema>) {
+    schemas.insert("Issue", schema_for_output::<Issue>());
+    schemas.insert("IssueWithCounts", schema_for_output::<IssueWithCounts>());
+    schemas.insert("IssueDetails", schema_for_output::<IssueDetails>());
+    schemas.insert("ReadyIssue", schema_for_output::<ReadyIssue>());
+    schemas.insert("StaleIssue", schema_for_output::<StaleIssue>());
+    schemas.insert("BlockedIssue", schema_for_output::<BlockedIssueOutput>());
+    schemas.insert("TreeNode", schema_for_output::<TreeNode>());
+    schemas.insert("Roadmap", schema_for_output::<RoadmapOutput>());
+    schemas.insert("CountGroup", schema_for_output::<CountGroup>());
+    schemas.insert("Statistics", schema_for_output::<Statistics>());
+    schemas.insert(
+        "CoordinationStatusOutput",
+        schema_for_output::<CoordinationStatusOutput>(),
+    );
+    schemas.insert(
+        "CoordinationClaimRow",
+        schema_for_output::<CoordinationClaimRow>(),
+    );
+    schemas.insert(
+        "TypeCapabilityRegistry",
+        schema_for_output::<TypeCapabilityRegistry>(),
+    );
+    schemas.insert(
+        "SyncReconcileReceipt",
+        schema_for_output::<crate::cli::commands::sync::SyncReconcileReceipt>(),
+    );
+    schemas.insert(
+        "AdditiveReconcileReceipt",
+        schema_for_output::<AdditiveReconcileReceipt>(),
+    );
+    schemas.insert("VcsExportStatus", schema_for_output::<VcsExportStatus>());
+    schemas.insert("RedirectReceipt", schema_for_output::<RedirectReceipt>());
+    schemas.insert("ErrorEnvelope", schema_for_output::<ErrorEnvelope>());
 }
 
 fn schema_for_output<T: JsonSchema>() -> Schema {
@@ -294,6 +319,7 @@ fn build_commands(target: SchemaTarget) -> BTreeMap<&'static str, CommandShape> 
     insert_comment_command_shapes(&mut commands);
     insert_dependency_command_shapes(&mut commands);
     insert_aggregate_command_shapes(&mut commands);
+    insert_issue_type_command_shapes(&mut commands);
     insert_label_command_shapes(&mut commands);
     commands.insert(
         "sync --reconcile-additive",
@@ -327,6 +353,20 @@ fn build_commands(target: SchemaTarget) -> BTreeMap<&'static str, CommandShape> 
             ),
         },
     );
+    let redirect_receipt = CommandShape {
+        shape: "object",
+        jq_filter: ".",
+        items_at: None,
+        item_schema: Some("RedirectReceipt"),
+        error_envelope_on_stderr: false,
+        notes: Some(
+            "Stable br.redirect.v1 receipt. Setup validates through a target snapshot, never \
+             mutates the canonical target, and reports created, unchanged, primary_owner, or \
+             refused.",
+        ),
+    };
+    commands.insert("init --redirect", redirect_receipt.clone());
+    commands.insert("redirect set", redirect_receipt);
 
     commands
 }
@@ -516,7 +556,9 @@ fn insert_aggregate_command_shapes(commands: &mut BTreeMap<&'static str, Command
             item_schema: None,
             error_envelope_on_stderr: false,
             notes: Some(
-                "Machine-readable command, feature, safety, exit-code, and env-var inventory.",
+                "Machine-readable command, feature, safety, exit-code, env-var, and effective \
+                 issue-type inventory. The issue_types field conforms to TypeCapabilityRegistry, \
+                 separating accepted standard/custom syntax from behavior-bearing registrations.",
             ),
         },
     );
@@ -544,6 +586,22 @@ fn insert_aggregate_command_shapes(commands: &mut BTreeMap<&'static str, Command
             notes: Some(
                 "Read-only object with workspace summary and `claims[]` rows. The \
                  full envelope schema is `CoordinationStatusOutput`.",
+            ),
+        },
+    );
+}
+
+fn insert_issue_type_command_shapes(commands: &mut BTreeMap<&'static str, CommandShape>) {
+    commands.insert(
+        "roadmap",
+        CommandShape {
+            shape: "object",
+            jq_filter: ".",
+            items_at: None,
+            item_schema: Some("Roadmap"),
+            error_envelope_on_stderr: false,
+            notes: Some(
+                "Workflow-generic containment and traceability envelope; execution edges are excluded.",
             ),
         },
     );
@@ -607,6 +665,23 @@ mod tests {
             !shape.error_envelope_on_stderr,
             "top-level structured CLI errors are emitted on stdout"
         );
+    }
+
+    #[test]
+    fn redirect_receipt_schema_and_command_shapes_are_discoverable() {
+        let schemas = build_schemas(SchemaTarget::RedirectReceipt);
+        assert!(schemas.contains_key("RedirectReceipt"));
+
+        let commands = build_commands(SchemaTarget::Commands);
+        for name in ["init --redirect", "redirect set"] {
+            let shape = commands.get(name).expect("redirect command shape");
+            assert_eq!(shape.shape, "object");
+            assert_eq!(shape.item_schema, Some("RedirectReceipt"));
+            assert!(
+                !shape.error_envelope_on_stderr,
+                "redirect refusals use the top-level structured CLI stdout stream"
+            );
+        }
     }
 
     #[test]

@@ -727,7 +727,12 @@ fn e2e_routing_update_external_issue_via_main_workspace() {
         ["update", &external_id, "--status", "in_progress", "--json"],
         "update_external_via_route",
     );
-    assert!(update.status.success(), "update failed: {}", update.stderr);
+    assert!(
+        update.status.success(),
+        "update failed: stdout={} stderr={}",
+        update.stdout,
+        update.stderr
+    );
     let update_payload = extract_json_payload(&update.stdout);
     let updated: Value = serde_json::from_str(&update_payload).expect("update json");
     let updated_array = updated.as_array().expect("update array");
@@ -3502,7 +3507,8 @@ fn e2e_routing_path_normalization() {
     );
     assert!(
         list.status.success(),
-        "Expected success with normalized path: {}",
+        "Expected success with normalized path: stdout={} stderr={}",
+        list.stdout,
         list.stderr
     );
 }

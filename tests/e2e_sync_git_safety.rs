@@ -1214,7 +1214,7 @@ fn regression_sync_never_touches_source_files() {
 /// `src/config/mod.rs::backup_database_family_for_recovery`; it does not
 /// flow through `src/sync/path.rs::validate_sync_path`.
 ///
-/// See `.beads/SYNC_SAFETY_INVARIANTS.md` invariant **PC-RECOVERY** for the
+/// See `docs/SYNC_SAFETY_INVARIANTS.md` invariant **PC-RECOVERY** for the
 /// precise contract.
 fn is_allowed_sync_file(rel_path: &str) -> bool {
     // Must be under .beads/
@@ -1229,8 +1229,34 @@ fn is_allowed_sync_file(rel_path: &str) -> bool {
         .unwrap_or_default();
 
     // Check exact name matches
-    const ALLOWED_EXACT_NAMES: &[&str] = &[".manifest.json", "metadata.json", "last-touched"];
+    const ALLOWED_EXACT_NAMES: &[&str] = &[
+        ".manifest.json",
+        ".write.lock",
+        "metadata.json",
+        "last-touched",
+    ];
     if ALLOWED_EXACT_NAMES.iter().any(|&name| filename == name) {
+        return true;
+    }
+
+    // Stable database/JSONL write-authority sidecars are coordination state,
+    // not sync payloads. Accept only the exact hash-derived production shape;
+    // arbitrary `.lock` files must remain visible as safety violations.
+    let is_direct_beads_child =
+        rel_path == format!(".beads/{filename}") || rel_path == format!(".beads\\{filename}");
+    if is_direct_beads_child
+        && [".br-db-write-", ".br-jsonl-write-"].iter().any(|prefix| {
+            filename
+                .strip_prefix(prefix)
+                .and_then(|value| value.strip_suffix(".lock"))
+                .is_some_and(|digest| {
+                    digest.len() == 24
+                        && digest
+                            .bytes()
+                            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+                })
+        })
+    {
         return true;
     }
 
@@ -1290,6 +1316,26 @@ fn is_allowed_sync_file(rel_path: &str) -> bool {
     }
 
     false
+}
+
+#[test]
+fn sync_allowlist_accepts_only_exact_write_authority_sidecars() {
+    assert!(is_allowed_sync_file(
+        ".beads/.br-db-write-0123456789abcdef01234567.lock"
+    ));
+    assert!(is_allowed_sync_file(
+        ".beads/.br-jsonl-write-0123456789abcdef01234567.lock"
+    ));
+    assert!(!is_allowed_sync_file(
+        ".beads/.br-jsonl-write-0123456789abcdef0123456.lock"
+    ));
+    assert!(!is_allowed_sync_file(
+        ".beads/.br-jsonl-write-0123456789abcdef0123456G.lock"
+    ));
+    assert!(!is_allowed_sync_file(
+        ".beads/nested/.br-jsonl-write-0123456789abcdef01234567.lock"
+    ));
+    assert!(!is_allowed_sync_file(".beads/unrelated.lock"));
 }
 
 /// Represents a complete file tree snapshot for comparison.
@@ -2086,7 +2132,7 @@ fn integration_sync_manifest_only_touches_allowed_files() {
 
 // ============================================================================
 // beads_rust-yyxo: additional sync-safety regression tests (added 2026-05-09)
-// Per SYNC_SAFETY_INVARIANTS.md PC-1, PC-3, PC-RECOVERY, NGI-3.
+// Per docs/SYNC_SAFETY_INVARIANTS.md PC-1, PC-3, PC-RECOVERY, NGI-3.
 // Each test emits tracing-style eprintln! lines per phase so the test log
 // alone tells the story.
 // ============================================================================

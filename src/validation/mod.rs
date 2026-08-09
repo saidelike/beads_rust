@@ -269,7 +269,12 @@ pub trait DependencyStore {
     /// # Errors
     ///
     /// Returns an error if the storage lookup fails.
-    fn dependency_exists(&self, issue_id: &str, depends_on_id: &str) -> Result<bool, BeadsError>;
+    fn dependency_exists(
+        &self,
+        issue_id: &str,
+        depends_on_id: &str,
+        dep_type: &DependencyType,
+    ) -> Result<bool, BeadsError>;
     /// Return true if adding the dependency would create a cycle.
     ///
     /// # Errors
@@ -356,7 +361,7 @@ impl DependencyValidator {
             ));
         }
 
-        if store.dependency_exists(&dep.issue_id, &dep.depends_on_id)? {
+        if store.dependency_exists(&dep.issue_id, &dep.depends_on_id, &dep.dep_type)? {
             errors.push(ValidationError::new(
                 "depends_on_id",
                 "dependency already exists",
@@ -1037,6 +1042,7 @@ mod tests {
             &self,
             _issue_id: &str,
             _depends_on_id: &str,
+            _dep_type: &DependencyType,
         ) -> Result<bool, BeadsError> {
             Ok(self.dependency_exists)
         }
@@ -1145,6 +1151,7 @@ mod tests {
             &self,
             _issue_id: &str,
             _depends_on_id: &str,
+            _dep_type: &DependencyType,
         ) -> Result<bool, BeadsError> {
             Ok(false)
         }

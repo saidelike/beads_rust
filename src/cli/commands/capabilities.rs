@@ -3,6 +3,8 @@
 use crate::cli::{
     CapabilitiesArgs, Cli, OutputFormat, resolve_output_format_basic_with_outer_mode,
 };
+use crate::close_policy::TypeCapabilityRegistry;
+use crate::config;
 use crate::error::{BeadsError, Result};
 use crate::output::{OutputContext, OutputMode};
 use clap::{Arg, Command as ClapCommand, CommandFactory};
@@ -23,6 +25,7 @@ struct CapabilitiesOutput {
     env_vars: &'static [EnvVarCapability],
     safety: &'static [SafetyCapability],
     recommended_entrypoints: &'static [&'static str],
+    issue_types: TypeCapabilityRegistry,
     #[serde(skip_serializing_if = "Option::is_none")]
     command_detail: Option<CommandDetail>,
 }
@@ -130,6 +133,10 @@ const FEATURES: &[FeatureCapability] = &[
     FeatureCapability {
         name: "coordination_diagnostics",
         description: "br coordination status diagnoses hidden or stale in-progress claims.",
+    },
+    FeatureCapability {
+        name: "shared_worktree_workspace",
+        description: "Secondary Git worktrees can safely redirect their entire .beads workspace to one canonical authority.",
     },
     FeatureCapability {
         name: "mcp_stdio_optional",
@@ -269,7 +276,11 @@ const RECOMMENDED_ENTRYPOINTS: &[&str] = &[
 /// # Errors
 ///
 /// Returns an error if output serialization fails.
-pub fn execute(args: &CapabilitiesArgs, outer_ctx: &OutputContext) -> Result<()> {
+pub fn execute(
+    args: &CapabilitiesArgs,
+    cli: &config::CliOverrides,
+    outer_ctx: &OutputContext,
+) -> Result<()> {
     let output_format = resolve_output_format_basic_with_outer_mode(
         args.format,
         outer_ctx.inherited_output_mode(),
@@ -286,6 +297,13 @@ pub fn execute(args: &CapabilitiesArgs, outer_ctx: &OutputContext) -> Result<()>
         .as_deref()
         .map(command_detail_for_path)
         .transpose()?;
+    let issue_types = config::discover_optional_beads_dir_with_cli(cli)?.map_or_else(
+        || Ok(TypeCapabilityRegistry::default()),
+        |beads_dir| {
+            let policy = crate::close_policy::load_for_beads_dir(&beads_dir)?;
+            TypeCapabilityRegistry::resolve(&policy.issue_types)
+        },
+    )?;
 
     let payload = CapabilitiesOutput {
         tool: "br",
@@ -299,6 +317,7 @@ pub fn execute(args: &CapabilitiesArgs, outer_ctx: &OutputContext) -> Result<()>
         env_vars: ENV_VARS,
         safety: SAFETY,
         recommended_entrypoints: RECOMMENDED_ENTRYPOINTS,
+        issue_types,
         command_detail,
     };
 
@@ -501,6 +520,10 @@ fn parent_examples(name: &str) -> &'static [&'static str] {
         ],
         "config" => &["br config get output.format --json"],
         "history" => &["br history list --json"],
+        "redirect" => &[
+            "br redirect set --allow-existing --json",
+            "br redirect set /absolute/path/to/primary/.beads --allow-existing --json",
+        ],
         _ => &[],
     }
 }
@@ -552,6 +575,16 @@ fn command_safety_notes(name: &str) -> &'static [&'static str] {
             "Use `doctor migrate-schema plan --json` before apply; apply requires the exact state-bound plan token.",
             "Migration undo refuses changed post-migration data, quarantines the displaced family without deletion, and is resumable.",
         ],
+        "init" => &[
+            "Ordinary init creates a tracker; `init --redirect` creates only a local redirect file and never mutates or repairs the target.",
+            "Omit the redirect target only for a standard linked Git worktree layout; otherwise provide the exact initialized .beads path.",
+            "Redirect setup never launches Git, installs hooks, imports JSONL, or migrates a target schema.",
+        ],
+        "redirect" | "redirect set" => &[
+            "Existing material local state is preserved and requires explicit `--allow-existing` acknowledgement before it becomes dormant.",
+            "Matching repeated requests are no-ops; conflicting redirects are preserved and rejected.",
+            "There is no redirect-removal command in this contract.",
+        ],
         "search" => &[
             "Search is read-only; prefer `--format json` or `--format toon` for parsing.",
             "Use list-style filters after the query to narrow result sets.",
@@ -569,6 +602,11 @@ fn command_safety_notes(name: &str) -> &'static [&'static str] {
             "Scheduler is read-only and ranks already-ready issues; it does not claim work.",
             "Scheduler honors the same `workflow.status_groups.ready` group as `br ready`.",
             "Use `--limit` for returned recommendations and `--candidate-limit` for the scoring window.",
+        ],
+        "roadmap" => &[
+            "Roadmap is read-only and follows parent-child, derived-from, and implements only.",
+            "Execution prerequisites remain visible through dep tree and graph, not roadmap.",
+            "Use --format json for the versioned lossless contract; Mermaid and DOT are deterministic diagrams.",
         ],
         "upgrade" => {
             &["Use `--check` to inspect availability before changing the installed binary."]
@@ -605,7 +643,7 @@ fn dep_safety_notes(name: &str) -> &'static [&'static str] {
         ],
         "dep add" => &[
             "`dep add <issue> <depends-on>` means `<issue>` waits on `<depends-on>`.",
-            "Default dependency type is `blocks`; use `--type parent-child` only for parent/child hierarchy.",
+            "Default dependency type is `blocks`; derived-from and implements are non-execution traceability relations.",
             "External dependency IDs must start with `external:` and are not locally resolved.",
         ],
         "dep import" => &[
@@ -615,6 +653,7 @@ fn dep_safety_notes(name: &str) -> &'static [&'static str] {
         ],
         "dep remove" => &[
             "Removes the edge from `<issue>` to `<depends-on>`; it does not delete either issue.",
+            "Use `--type` when the ordered pair has multiple relation types; untyped ambiguous removal is rejected.",
             "JSON output reports `not_found` when the dependency edge was absent.",
         ],
         "dep list" => &[
@@ -691,6 +730,7 @@ fn command_contract(name: &str) -> CommandContract {
             examples: &[
                 "br dep add br-task br-blocker --type blocks --json",
                 "br dep add br-child br-parent --type parent-child --json",
+                "br dep add br-implementation br-spec --type implements --json",
                 "br dep add br-task external:repo-123 --metadata '{\"repo\":\"other\"}' --json",
             ],
         },
@@ -707,7 +747,10 @@ fn command_contract(name: &str) -> CommandContract {
             operation: "write",
             workspace: "required",
             machine_output: &["json", "toon", "text"],
-            examples: &["br dep remove br-task br-blocker --json"],
+            examples: &[
+                "br dep remove br-task br-blocker --json",
+                "br dep remove br-implementation br-spec --type implements --json",
+            ],
         },
         "dep list" => CommandContract {
             operation: "read",
@@ -804,6 +847,15 @@ fn command_contract(name: &str) -> CommandContract {
             machine_output: &["json", "toon", "text"],
             examples: &["br epic close-eligible --dry-run --json"],
         },
+        "roadmap" => CommandContract {
+            operation: "read",
+            workspace: "required",
+            machine_output: &["json", "mermaid", "dot", "text"],
+            examples: &[
+                "br roadmap br-map --format json",
+                "br roadmap br-implementation --focus implementations --only graph",
+            ],
+        },
         "capabilities" => CommandContract {
             operation: "read",
             workspace: "none",
@@ -837,8 +889,27 @@ fn command_contract(name: &str) -> CommandContract {
         "init" => CommandContract {
             operation: "write",
             workspace: "none",
-            machine_output: &["text"],
-            examples: &["br init --prefix br"],
+            machine_output: &["json", "text"],
+            examples: &[
+                "br init --prefix br",
+                "br init --redirect --json",
+                "br init --redirect /absolute/path/to/primary/.beads --json",
+            ],
+        },
+        "redirect set" => CommandContract {
+            operation: "write",
+            workspace: "required",
+            machine_output: &["json", "text"],
+            examples: &[
+                "br redirect set --allow-existing --json",
+                "br redirect set /absolute/path/to/primary/.beads --allow-existing --json",
+            ],
+        },
+        "redirect" => CommandContract {
+            operation: "write",
+            workspace: "required",
+            machine_output: &["json", "text"],
+            examples: parent_examples(name),
         },
         "create" => CommandContract {
             operation: "write",
@@ -1051,6 +1122,8 @@ fn render_text(output: &CapabilitiesOutput, requested_command: Option<&str>) {
         println!("  {command}");
     }
     println!();
+    render_issue_types_text(&output.issue_types);
+    println!();
     println!("Commands:");
     for command in &output.commands {
         println!(
@@ -1116,6 +1189,44 @@ fn render_text(output: &CapabilitiesOutput, requested_command: Option<&str>) {
     }
 }
 
+fn render_issue_types_text(issue_types: &TypeCapabilityRegistry) {
+    println!("Issue type acceptance:");
+    println!(
+        "  standard types: {}",
+        issue_types.standard_types.join(", ")
+    );
+    if issue_types.accepts_custom_types {
+        println!("  custom types: accepted with neutral capabilities unless registered");
+    } else {
+        println!("  custom types: not accepted");
+    }
+    println!("Active capability profiles:");
+    if issue_types.active_profiles.is_empty() {
+        println!("  none");
+    } else {
+        println!("  {}", issue_types.active_profiles.join(", "));
+    }
+    println!("Issue type capability registrations:");
+    for entry in issue_types.types.values() {
+        let caps = entry.capabilities;
+        println!(
+            "  {:<16} source={:<16} roadmap_role={} aggregate={} ready_work={} blocked_by_open_children={} \
+             may_close_with_open_children={} inherited_context_root={}",
+            entry.name,
+            entry.source,
+            entry.roadmap_role.map_or_else(
+                || "unclassified".to_string(),
+                |role| format!("{role:?}").to_lowercase()
+            ),
+            caps.aggregate,
+            caps.ready_work,
+            caps.blocked_by_open_children,
+            caps.may_close_with_open_children,
+            caps.inherited_context_root,
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{command_contract, command_detail_for_path};
@@ -1160,6 +1271,32 @@ mod tests {
                 .safety_notes
                 .iter()
                 .any(|note| note.contains("never cross a schema-version boundary"))
+        );
+    }
+
+    #[test]
+    fn redirect_capability_exposes_receipts_and_preservation_boundaries() {
+        let init = command_contract("init");
+        assert!(init.machine_output.contains(&"json"));
+        assert!(
+            init.examples
+                .iter()
+                .any(|example| example.contains("init --redirect --json"))
+        );
+
+        let detail = command_detail_for_path("redirect set").expect("redirect set detail");
+        assert_eq!(detail.operation, "write");
+        assert!(
+            detail
+                .safety_notes
+                .iter()
+                .any(|note| note.contains("--allow-existing"))
+        );
+        assert!(
+            detail
+                .safety_notes
+                .iter()
+                .any(|note| note.contains("no redirect-removal"))
         );
     }
 }

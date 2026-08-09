@@ -262,10 +262,12 @@ where
     // RUST_LOG through the caller `env_vars`, which are applied after these
     // defaults and so still win.
     cmd.env("RUST_LOG", "error");
+    // Put the harness default before caller overrides. Missing-tool and
+    // hostile-PATH tests must be able to replace PATH explicitly.
+    cmd.env("PATH", deduplicated_br_path());
     cmd.envs(env_vars);
     cmd.env("NO_COLOR", "1");
     cmd.env("RUST_BACKTRACE", "1");
-    cmd.env("PATH", deduplicated_br_path());
 }
 
 fn run_br_full_in_root<I, S, E, K, V>(

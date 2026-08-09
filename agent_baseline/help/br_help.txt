@@ -21,6 +21,7 @@ Commands:
   dep           Manage dependencies
   doctor        Run diagnostics and optionally repair issues
   epic          Epic management commands
+  roadmap       Show containment and traceability as one workflow roadmap
   gate          Workflow gate engine: record and inspect gate results (issue #312)
   graph         Visualize the dependents graph: what an issue unblocks
   history       Manage local history backups
@@ -33,6 +34,7 @@ Commands:
   q             Quick capture (create issue, print ID only)
   query         Manage saved queries
   ready         List ready issues (open, unblocked, not deferred)
+  redirect      Manage worktree workspace redirects
   reopen        Reopen an issue
   robot-docs    Print concise in-tool docs for automation agents
   scheduler     Rank ready work for agent swarms with explainable evidence
@@ -45,6 +47,7 @@ Commands:
   sync          Sync database with JSONL file (export or import)
   undefer       Undefer issues (make ready again)
   update        Update an issue
+  vcs-status    Explicitly inspect Git visibility for the configured JSONL export
   upgrade       Upgrade br to the latest version
   version       Show version information
   where         Show the active .beads directory

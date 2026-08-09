@@ -174,6 +174,8 @@ impl From<ReviewedSchemaMigrationEffects> for ReviewedSchemaMigrationEffectsRece
     }
 }
 
+// Serde's `skip_serializing_if` callback contract passes the field by reference.
+#[allow(clippy::trivially_copy_pass_by_ref)]
 const fn is_false(value: &bool) -> bool {
     !*value
 }
@@ -207,7 +209,7 @@ struct PlanTokenMaterial<'a> {
 struct MigrationContext {
     beads_dir: PathBuf,
     db_path: PathBuf,
-    _write_authority: Arc<DatabaseFamilyWriteLock>,
+    write_authority: Arc<DatabaseFamilyWriteLock>,
 }
 
 /// Execute `br doctor migrate-schema ...`.
@@ -251,7 +253,7 @@ fn resolve_context(cli: &config::CliOverrides) -> Result<MigrationContext> {
     Ok(MigrationContext {
         beads_dir,
         db_path: paths.db_path,
-        _write_authority: write_authority,
+        write_authority,
     })
 }
 
@@ -261,6 +263,8 @@ fn execute_plan(args: &DoctorMigrateSchemaPlanArgs, migration: &MigrationContext
     Ok(())
 }
 
+// Keep the eligibility gates and the resulting signed forecast together for auditability.
+#[allow(clippy::too_many_lines)]
 fn build_plan(db_path: &Path) -> Result<MigrationPlanReceipt> {
     refuse_non_regular_component(db_path)?;
     let logical_witness = logical_witness(db_path)?;
@@ -329,7 +333,7 @@ fn build_plan(db_path: &Path) -> Result<MigrationPlanReceipt> {
     }
     if !REVIEWED_MIGRATION_SOURCE_VERSIONS.contains(&from) {
         return Err(BeadsError::internal(format!(
-            "reviewed schema migration is available only from source schemas 13, 14, 15, and 16 \
+            "reviewed schema migration is available only from source schemas 13 through 18 \
              to {target}; observed unsupported source version {from}"
         )));
     }
@@ -419,6 +423,8 @@ fn emit_plan(plan: &MigrationPlanReceipt, json: bool) -> Result<()> {
     Ok(())
 }
 
+// Keep preparation, mutation, failure receipts, and attestation in one auditable flow.
+#[allow(clippy::too_many_lines)]
 fn execute_apply(args: &DoctorMigrateSchemaApplyArgs, migration: &MigrationContext) -> Result<()> {
     if args.plan_token.trim().is_empty() {
         return Err(BeadsError::internal(
@@ -466,16 +472,16 @@ fn execute_apply(args: &DoctorMigrateSchemaApplyArgs, migration: &MigrationConte
     let prepared_receipt_sha256 = file_sha256(&run_dir.join("prepared.json"))?;
     sync_directory(&run_dir)?;
 
-    migration._write_authority.verify_database_authority()?;
+    migration.write_authority.verify_database_authority()?;
     let migration_result = apply_reviewed_migration(
         &migration.db_path,
         forecast.from_version,
         forecast.to_version,
         &marked_at,
         &run_dir,
-        &migration._write_authority,
+        &migration.write_authority,
     );
-    migration._write_authority.verify_database_authority()?;
+    migration.write_authority.verify_database_authority()?;
     let effects = match migration_result {
         Ok(effects) => effects,
         Err(error) => {
@@ -620,6 +626,8 @@ fn apply_reviewed_migration(
     run_post_migration_maintenance(db_path, from, to, marked_at, run_dir, write_authority)
 }
 
+// Keep candidate creation, atomic replacement, rollback, and attestation contiguous for auditability.
+#[allow(clippy::too_many_lines)]
 fn run_post_migration_maintenance(
     db_path: &Path,
     from: u32,
@@ -646,8 +654,7 @@ fn run_post_migration_maintenance(
         .map_err(BeadsError::Database);
     let close_result = close_connection(source_conn);
     match (candidate_result, close_result) {
-        (Err(error), _) => return Err(error),
-        (Ok(()), Err(error)) => return Err(error),
+        (Err(error), _) | (Ok(()), Err(error)) => return Err(error),
         (Ok(()), Ok(())) => {}
     }
 
@@ -689,8 +696,7 @@ fn run_post_migration_maintenance(
     })();
     let close_result = close_connection(candidate_conn);
     match (maintenance_result, close_result) {
-        (Err(error), _) => return Err(error),
-        (Ok(()), Err(error)) => return Err(error),
+        (Err(error), _) | (Ok(()), Err(error)) => return Err(error),
         (Ok(()), Ok(())) => {}
     }
 
@@ -1747,7 +1753,7 @@ fn hash_regular_file(path: &Path, expected: &fs::Metadata) -> Result<(u64, Strin
     }
     let mut hasher = Sha256::new();
     let mut length = 0_u64;
-    let mut buffer = [0_u8; 1024 * 1024];
+    let mut buffer = vec![0_u8; 1024 * 1024].into_boxed_slice();
     loop {
         let read = file.read(&mut buffer).map_err(BeadsError::Io)?;
         if read == 0 {
@@ -1775,6 +1781,8 @@ fn same_file_identity(expected: &fs::Metadata, opened: &fs::Metadata) -> bool {
 }
 
 #[cfg(unix)]
+// The `Option` return type intentionally matches the non-Unix branch used by portable witnesses.
+#[allow(clippy::unnecessary_wraps)]
 fn unix_file_mode(metadata: &fs::Metadata) -> Option<u32> {
     use std::os::unix::fs::PermissionsExt;
     Some(metadata.permissions().mode())
@@ -2372,7 +2380,7 @@ mod tests {
             MigrationContext {
                 beads_dir,
                 db_path,
-                _write_authority: authority,
+                write_authority: authority,
             },
         )
     }

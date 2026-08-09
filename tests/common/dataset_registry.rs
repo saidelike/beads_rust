@@ -137,6 +137,8 @@ pub enum WorkspaceFailureCommandOutcome {
     FailsPrefixMismatch,
     FailsConflictMarkers,
     FailsInvalidJson,
+    FailsDatabaseAuthority,
+    FailsDoctorAuthority,
     FailsRepeatedRepair,
 }
 

@@ -41,6 +41,7 @@ use beads_rust::storage::SqliteStorage;
 use beads_rust::util::hex_encode;
 use chrono::Utc;
 use common::binary_discovery::discover_binaries;
+use common::cli::isolated_temp_root;
 use common::dataset_registry::KnownDataset;
 use fsqlite::Connection;
 use fsqlite_types::SqliteValue;
@@ -385,7 +386,7 @@ impl SyntheticDataset {
     /// Returns an error if the temporary workspace or any CLI command fails.
     pub fn generate(config: SyntheticConfig, br_path: &Path) -> std::io::Result<Self> {
         let start = Instant::now();
-        let temp_dir = TempDir::new()?;
+        let temp_dir = TempDir::new_in(isolated_temp_root())?;
         let root = temp_dir.path().to_path_buf();
         let beads_dir = root.join(".beads");
         let manifest_path = root.join("synthetic-corpus-manifest.json");
@@ -487,7 +488,7 @@ impl SyntheticDataset {
         br_path: &Path,
     ) -> std::io::Result<Self> {
         let start = Instant::now();
-        let temp_dir = TempDir::new()?;
+        let temp_dir = TempDir::new_in(isolated_temp_root())?;
         let root = temp_dir.path().to_path_buf();
         let beads_dir = root.join(".beads");
         let manifest_path = root.join("synthetic-corpus-manifest.json");

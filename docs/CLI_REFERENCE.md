@@ -151,6 +151,7 @@ br init [OPTIONS]
 | `--prefix <PREFIX>` | Issue ID prefix (e.g., "bd", "proj") |
 | `--force` | Overwrite existing database |
 | `--backend <BACKEND>` | Backend type placeholder; currently ignored and always uses SQLite |
+| `--redirect [<BEADS_DIR>]` | Create only a worktree redirect; omit the target to discover the primary Git worktree |
 
 **Examples:**
 ```bash
@@ -163,6 +164,24 @@ br init --prefix myproj
 # Force reinitialize
 br init --force
 ```
+
+Redirect initialization creates no database and does not mutate or repair the
+target. See [Shared br Workspaces Across Git Worktrees](WORKTREE_REDIRECTS.md)
+for automatic discovery, exact targets, lifecycle automation, bypasses, and
+recovery.
+
+### redirect set
+
+Route an already initialized worktree to a canonical tracker while preserving
+all local artifacts as dormant state.
+
+```bash
+br redirect set [<BEADS_DIR>] [--allow-existing]
+```
+
+The target is optional for standard linked Git worktrees. Material local state
+requires `--allow-existing`; the command never deletes, moves, or overwrites
+that state. Use global `--json` for the `br.redirect.v1` receipt.
 
 ---
 
@@ -180,7 +199,7 @@ br create [OPTIONS] [TITLE]
 **Options:**
 | Option | Description |
 |--------|-------------|
-| `-t, --type <TYPE>` | Issue type (task, bug, feature, epic, chore, docs, question) |
+| `-t, --type <TYPE>` | Issue type. Standard names are familiar suggestions rather than an allowlist; the parser also accepts custom strings. Discover `issue_types.standard_types`, `accepts_custom_types`, and behavior registrations under `types` with [`br capabilities --format json`](#capabilities). |
 | `-p, --priority <PRIORITY>` | Priority (0-4 or P0-P4, where 0=critical) |
 | `-d, --description <TEXT>` | Issue description |
 | `--slug <SLUG>` | Human-readable slug embedded in the generated ID (lowercase ASCII alphanumerics + single hyphens, capped at 48 chars; see [Slug normalization](#slug-normalization)) |
@@ -253,6 +272,34 @@ Three commits made `--slug` end-to-end:
 - [`52ff1722`](https://github.com/Dicklesworthstone/beads_rust/commit/52ff1722) `feat(orphans): scan all candidate-issue prefixes when finding commit refs` — `br orphans` finds commit references to slugged IDs.
 
 The full lifecycle round-trip (create with slug → show → update → close → orphans references) is verified by `tests/e2e_scripts/slug_round_trip.sh` (added by `beads_rust-l6xl`).
+
+#### Optional templated issue IDs
+
+By default, `br create` preserves the historical generated ID shapes:
+`<prefix>-<hash>` and, with `--slug`, `<prefix>-<slug>-<hash>`.
+Projects that prefer taskmd-like local shorthand can opt into templated IDs in
+`.beads/config.yaml`:
+
+```yaml
+id_generation:
+  mode: templated
+  template: "{seq:03}-{slug}-{hash}"
+  require_slug: true
+```
+
+Supported template tokens are `{prefix}`, `{seq}`, `{seq:03}`, `{slug}`, and
+`{hash}`. Unknown tokens are rejected when creating an issue. `{hash}` is
+required unless `id_generation.allow_non_unique_template: true` is set
+explicitly. When `{slug}` is present and no `--slug` is supplied, `br create`
+derives the slug from the issue title.
+
+Sequence values come from a repository-local counter, are not reused, and are
+retained in JSONL as `sequence_number`. Imports advance the local counter past
+imported sequence values. Numeric issue arguments such as `br show 001` resolve
+to the unique issue with sequence number `1`; if multiple issues share a
+sequence number, use the full issue ID. `br q` and MCP `create_issue` use the
+same configured generation policy, and CLI/MCP issue operations plus
+`beads://issues/{id}` accept unambiguous numeric sequence shorthand.
 
 ---
 
@@ -1016,7 +1063,7 @@ br dep <COMMAND>
 | Command | Description |
 |---------|-------------|
 | `add <ISSUE> <DEPENDS_ON>` | Add dependency (ISSUE depends on DEPENDS_ON) |
-| `remove <ISSUE> <DEPENDS_ON>` | Remove dependency |
+| `remove <ISSUE> <DEPENDS_ON> [--type TYPE]` | Remove the selected typed relation |
 | `list <ISSUE>` | List dependencies of an issue |
 | `tree <ISSUE>` | Show dependency tree |
 | `cycles` | Detect dependency cycles |
@@ -1024,6 +1071,8 @@ br dep <COMMAND>
 **Dependency Types:**
 - `blocks` (default) - Target blocks source
 - `parent-child` - Hierarchical relationship
+- `derived-from` - Non-execution provenance from an artifact to its source
+- `implements` - Non-execution realization from work to its governing contract
 - `discovered-from` - Discovered during work on another issue
 - `related` - Loosely related issues
 
@@ -1034,6 +1083,11 @@ br dep add bd-123 bd-456  # bd-123 is blocked by bd-456
 
 # Add with type
 br dep add bd-123 bd-456 --type discovered-from
+
+# Keep execution and traceability on the same ordered pair
+br dep add bd-implementation bd-spec --type blocks
+br dep add bd-implementation bd-spec --type implements
+br dep remove bd-implementation bd-spec --type implements
 
 # Show tree
 br dep tree bd-123
@@ -1057,7 +1111,7 @@ stopped the walk".
 
 - Only *blocking* dependency types are cycle-checked when an edge is added:
   `blocks`, `conditional-blocks`, `waits-for`, and `parent-child`.
-  `related`, `discovered-from`, and custom types are never cycle-checked,
+  `related`, `derived-from`, `implements`, `discovered-from`, and custom types are never cycle-checked,
   and `br dep cycles` uses the same blocking edge set, so an edge the add
   path accepted can never fail a cycle health check afterwards
   (`--blocking-only` is a compatible alias of the default).
@@ -1071,6 +1125,61 @@ stopped the walk".
   may traverse containment edges that the error path does not list. To
   express a loose association that must never gate work or trip cycle
   checks, use `-t related`.
+
+---
+
+### roadmap
+
+Render one workflow-generic view over stored containment and traceability:
+
+```bash
+br roadmap <ROOT> [OPTIONS]
+```
+
+`roadmap` follows only `parent-child`, `derived-from`, and `implements`. Stored
+artifact-to-source relations are displayed source-first, so Maps and other
+authorities lead to decisions, Specs, and implementation work. Blocking and
+other execution edges are deliberately excluded; use `br dep tree` or
+`br graph` for prerequisite analysis.
+
+Any issue can be `ROOT`. The command walks upstream to every earliest stored
+authority or natural root, then renders a deterministic forest. It never
+infers links from types, labels, titles, prose, or ID shapes.
+
+Roadmap presentation roles are configured beside behavioral capabilities in
+`.beads/policy.yaml`. The `matt-skills` profile assigns `map: authority`,
+`research`/`grilling`/`prototype: decision`, `spec: specification`, and
+`implementation: implementation`. Project definitions inherit omitted profile
+roles and may override them or assign a role to a custom type:
+
+```yaml
+issue_types:
+  profiles: [matt-skills]
+  types:
+    - name: publication
+      roadmap_role: specification
+```
+
+Roles classify roadmap presentation only; they do not alter readiness, closure,
+capacity, or scheduling behavior. `br capabilities --format json` exposes each
+resolved role separately from the type's capabilities.
+
+| Option | Description |
+|--------|-------------|
+| `--format <FORMAT>` | `text`, `json`, `mermaid`, or `dot`; TOON is rejected in v1 |
+| `--max-depth <N>` | Bound displayed mixed-relation hops; omitted means unlimited |
+| `--sort <TERMS>` | Sort inside containment, provenance, and realization groups |
+| `--wrap` | Soft-wrap human-readable node labels |
+| `--focus <ROLE>` | Repeatable/comma-separated `decisions` or `implementations`; both means the default view |
+| `--only <SECTION>` | Render only `graph` or `summary`; omitted renders both |
+
+JSON uses the versioned `br.roadmap.v1` envelope and preserves unique nodes,
+all actual typed roadmap edges, display placements/references, filters,
+truncation, directly related issue summaries, and recoverable diagnostics.
+`--only summary` keeps the envelope with empty graph arrays; `--only graph`
+emits an empty summaries array. Mermaid and DOT preserve all actual roadmap
+edges but reject `--only summary`. Human diagnostics go to stderr; JSON
+diagnostics remain in the envelope.
 
 ---
 
@@ -1434,7 +1543,7 @@ br sync [OPTIONS]
 - If open-time recovery rebuilt the database before a semantic import flag such as `--rename-prefix` could apply, br prints a rerun command that includes the needed flags.
 
 **Additive reconciliation semantics:**
-- `br sync --reconcile-additive --robot` is the default dry-run. It opens the current database read-only, compares exact issue IDs, and emits a hash-bound `br.sync.additive-reconciliation.v2` receipt plus a `plan_sha256` review token.
+- `br sync --reconcile-additive --robot` is the default dry-run. It opens the current database read-only, compares exact issue IDs, and emits a hash-bound `br.sync.additive-reconciliation.v3` receipt plus a `plan_sha256` review token.
 - The planner preserves SQLite-only issues, audit events, close metadata, gate-result history, runtime config, and every unmodified relation row. It never performs content-hash identity merges, physical deletes, JSONL writes, base-snapshot writes, or merge-note writes.
 - JSONL-only IDs are created. For a shared ID, only an `open`/`in_progress` to `closed` transition whose scalar diff is limited to `status`, `updated_at`, `closed_at`, and `close_reason` is accepted automatically. Other drift is a conflict. Exact-ID `--resolve-source-id` is limited to the documented non-lifecycle scalar whitelist and is rejected when JSONL is older than SQLite.
 - Explicit resolution never authorizes relation drift, tombstone resurrection, live-to-tombstone conversion, external-reference collision, orphan dependencies, or a newly introduced blocking cycle. Superfluous, duplicate, blank, and unknown resolution IDs are rejected.
@@ -1635,10 +1744,26 @@ br capabilities --format json --command "update"
 
 JSON and TOON output include `contract_version`,
 `recommended_entrypoints`, `features`, `commands`, `global_flags`,
-`exit_codes`, `env_vars`, and `safety`. When `--command` is supplied, output
-also includes `command_detail` with canonical path, aliases, subcommands,
-positionals, options, defaults, possible values, examples, command-specific
-safety notes, and workspace/safety contract metadata.
+`exit_codes`, `env_vars`, `safety`, and the merged, validated `issue_types`
+contract. `issue_types.standard_types` gives canonical suggestions,
+`accepts_custom_types` states whether other strings are valid,
+`active_profiles` identifies enabled profiles, and `types` contains only
+behavior-bearing registrations. Omission from `types` means neutral behavior,
+not rejection; `epic` can appear in both the standard list and registration
+map. Direct `.beads/policy.yaml` parsing is for troubleshooting only because
+this command performs the authoritative merge and validation.
+
+When `--command` is supplied, output also includes `command_detail` with
+canonical path, aliases, subcommands, positionals, options, defaults, possible
+values, examples, command-specific safety notes, and workspace/safety contract
+metadata. The `create --type` argument intentionally reports an empty
+`possible_values` array because its string domain is open; use the issue-type
+acceptance fields and registration keys for suggestions.
+
+Older `br.capabilities.v1` producers may omit the additive `standard_types` and
+`accepts_custom_types` fields. Treat that as legacy output preserving the
+historical standard/custom behavior, never as evidence that omitted names are
+forbidden.
 
 ---
 
@@ -1885,8 +2010,8 @@ br schema [TARGET] [OPTIONS]
 
 **Targets:** `all`, `issue`, `issue-with-counts`, `issue-details`,
 `ready-issue`, `stale-issue`, `blocked-issue`, `tree-node`, `statistics`,
-`coordination-status`, `additive-reconciliation`, `vcs-status`, `error`, and
-`commands`.
+`coordination-status`, `additive-reconciliation`, `vcs-status`,
+`redirect-receipt`, `error`, and `commands`.
 
 **Options:**
 | Option | Description |

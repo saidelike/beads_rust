@@ -5,9 +5,10 @@
   `fm-concurrency_primitives-orphaned-write-lock`
 - **Detect**: plants an old `.beads/.write.lock` plus an orphan
   `.write.lock.holder.pid` sidecar, matching the shape left behind by a killed
-  long-running `br serve` process. Doctor must classify the lock inode `ok`
-  with `details.reason == "persistent_advisory_inode"`; process exit already
-  released the OS lock.
+  long-running `br serve` process. Doctor must classify the lock inode `ok`.
+  A doctor invocation that already holds startup authority reports
+  `probe_would_block_live_holder`; a lock-free inspection may report
+  `persistent_advisory_inode`. Both prove that age alone is not a finding.
 - **Repair contract**: doctor must not move, remove, or rewrite either lock
   artifact automatically. The fixture proves device+inode identity across
   detect, repair, and undo; a subsequent real mutation proves the old inode

@@ -633,10 +633,14 @@ pub fn validate_sync_path_with_external(
     } else {
         path.to_path_buf()
     };
+    let normalized_resolved_path = normalize_path_lexically(&resolved_path);
     let is_internal = path.starts_with(beads_dir)
         || path.starts_with(&canonical_beads)
         || resolved_path.starts_with(beads_dir)
-        || resolved_path.starts_with(&canonical_beads);
+        || resolved_path.starts_with(&canonical_beads)
+        || normalized_resolved_path.as_ref().is_some_and(|normalized| {
+            normalized.starts_with(beads_dir) || normalized.starts_with(&canonical_beads)
+        });
 
     // CRITICAL: Git paths are ALWAYS rejected, even with allow_external. Do
     // not disclose an absolute external path while reporting that rejection.
@@ -1898,15 +1902,6 @@ fn windows_jsonl_file_identity(file: &File, path: &Path) -> Result<JsonlFileIden
 #[cfg(any(unix, windows))]
 fn absolute_jsonl_source_path(path: &Path) -> Result<PathBuf> {
     let descriptor = external_path_descriptor(path);
-    if path
-        .components()
-        .any(|component| matches!(component, std::path::Component::ParentDir))
-    {
-        return Err(BeadsError::Config(format!(
-            "{descriptor} contains traversal sequences"
-        )));
-    }
-
     let anchored = if path.is_absolute() {
         path.to_path_buf()
     } else {
@@ -1919,11 +1914,36 @@ fn absolute_jsonl_source_path(path: &Path) -> Result<PathBuf> {
             .join(path)
     };
 
-    normalize_path_lexically(&anchored).ok_or_else(|| {
-        BeadsError::Config(format!(
-            "Could not normalize JSONL source {descriptor} without escaping its filesystem root"
-        ))
-    })
+    let mut normalized = PathBuf::new();
+    for component in anchored.components() {
+        match component {
+            std::path::Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
+            std::path::Component::RootDir => normalized.push(component.as_os_str()),
+            std::path::Component::CurDir => {}
+            std::path::Component::Normal(part) => normalized.push(part),
+            std::path::Component::ParentDir => {
+                let parent = normalized.parent().ok_or_else(|| {
+                    BeadsError::Config(format!(
+                        "Could not normalize JSONL source {descriptor} without escaping its filesystem root"
+                    ))
+                })?;
+
+                // A lexical `component/..` collapse is only equivalent to
+                // filesystem traversal when `component` is a real directory,
+                // not a symlink or Windows reparse point. Prove that property
+                // through the same no-follow route walker used by the final
+                // pinned source before discarding the component.
+                open_jsonl_directory_via_stable_route(path, &normalized).map_err(|error| {
+                    BeadsError::Config(format!(
+                        "Could not safely normalize a parent component in JSONL source {descriptor}: {error}"
+                    ))
+                })?;
+                normalized = parent.to_path_buf();
+            }
+        }
+    }
+
+    Ok(normalized)
 }
 
 #[cfg(unix)]
@@ -2087,8 +2107,9 @@ where
 ///
 /// This platform capability primitive:
 ///
-/// 1. rejects traversal and opens every route component relative to a retained
-///    parent handle without following symlinks or Windows reparse points;
+/// 1. normalizes parent traversal only through proven ordinary directories,
+///    then opens every route component relative to a retained parent handle
+///    without following symlinks or Windows reparse points;
 /// 2. opens read-only and retains the exact opened generation;
 /// 3. requires the opened fd to identify a regular file; and
 /// 4. compares the handle's stable filesystem identity with a fresh
@@ -2364,7 +2385,7 @@ where
     let mut file = opened.into_file();
     let mut hasher = Sha256::new();
     let mut remaining = before_metadata.len();
-    let mut buffer = [0_u8; 64 * 1024];
+    let mut buffer = vec![0_u8; 64 * 1024].into_boxed_slice();
     while remaining > 0 {
         ensure_jsonl_capture_deadline(deadline)?;
         let wanted = usize::try_from(remaining.min(buffer.len() as u64))
@@ -2590,6 +2611,16 @@ mod tests {
     fn deadline_aware_snapshot_refuses_expired_and_overrun_reads() {
         use std::io::Read;
 
+        struct SlowReader;
+
+        impl Read for SlowReader {
+            fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+                buffer[0] = b'x';
+                Ok(1)
+            }
+        }
+
         let (_temp, beads_dir) = setup_test_beads_dir();
         let path = beads_dir.join("issues.jsonl");
         std::fs::write(&path, b"{\"id\":\"br-timeout\"}\n").expect("write JSONL fixture");
@@ -2603,15 +2634,6 @@ mod tests {
             ),
             "unexpected expired-deadline error: {expired}"
         );
-
-        struct SlowReader;
-        impl Read for SlowReader {
-            fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
-                std::thread::sleep(std::time::Duration::from_millis(5));
-                buffer[0] = b'x';
-                Ok(1)
-            }
-        }
 
         let mut reader = DeadlineReader {
             inner: SlowReader,
@@ -2685,6 +2707,41 @@ mod tests {
         assert!(
             result.is_allowed(),
             "Normalized in-tree paths should be allowed"
+        );
+        validate_sync_path_with_external(&path, &beads_dir, false)
+            .expect("external-path wrapper should preserve normalized internal classification");
+        open_jsonl_source_nofollow(&path)
+            .expect("secure source capture should preserve normalized internal routes");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn normalized_jsonl_source_rejects_cancelled_symlink_component() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new().expect("tempdir");
+        let physical_root = temp.path().join("physical");
+        let physical_child = physical_root.join("child");
+        let physical_beads = physical_root.join(".beads");
+        std::fs::create_dir_all(&physical_child).expect("create physical child");
+        std::fs::create_dir_all(&physical_beads).expect("create physical beads dir");
+        std::fs::write(physical_beads.join("issues.jsonl"), "{\"physical\":true}\n")
+            .expect("write physical JSONL");
+
+        let lexical_beads = temp.path().join(".beads");
+        std::fs::create_dir_all(&lexical_beads).expect("create lexical beads dir");
+        std::fs::write(lexical_beads.join("issues.jsonl"), "{\"lexical\":true}\n")
+            .expect("write lexical JSONL");
+
+        let link = temp.path().join("link");
+        symlink(&physical_child, &link).expect("create directory symlink");
+        let source = link.join("..").join(".beads/issues.jsonl");
+
+        let error = open_jsonl_source_nofollow(&source)
+            .expect_err("cancelled symlink component must not be normalized away");
+        assert!(
+            error.to_string().contains("must not be a symlink"),
+            "unexpected cancelled-symlink error: {error}"
         );
     }
 

@@ -1,10 +1,14 @@
 #![cfg(all(unix, feature = "mcp"))]
 
+mod common;
+
+use common::cli::isolated_temp_root;
 use std::ffi::OsStr;
-use std::io::Write;
+use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
 use std::process::{Child, Command, Output, Stdio};
-use std::thread;
+use std::sync::mpsc::{Receiver, sync_channel};
+use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use tempfile::TempDir;
@@ -33,6 +37,8 @@ fn br_command(root: &Path) -> Command {
     command.env("HOME", root);
     command.env("NO_COLOR", "1");
     command.env("RUST_LOG", "error");
+    command.env_remove("FASTMCP_NO_BANNER");
+    command.env("FASTMCP_BANNER", "full");
     command
 }
 
@@ -54,11 +60,57 @@ fn send_sigint(pid: u32) {
     assert!(status.success(), "kill -INT {pid} failed: {status}");
 }
 
-fn wait_with_timeout(mut child: Child, timeout: Duration) -> Output {
+fn capture_stderr_until_exit(child: &mut Child) -> (Receiver<()>, JoinHandle<Vec<u8>>) {
+    let stderr = child.stderr.take().expect("capture serve stderr");
+    let (ready_sender, ready_receiver) = sync_channel(1);
+    let reader = thread::spawn(move || {
+        let mut stderr = BufReader::new(stderr);
+        let mut output = Vec::new();
+        let mut line = Vec::new();
+        let mut ready_sent = false;
+        loop {
+            line.clear();
+            match stderr.read_until(b'\n', &mut line) {
+                Ok(0) => break,
+                Ok(_) => {
+                    if !ready_sent
+                        && line
+                            .windows(b"Server ready.".len())
+                            .any(|window| window == b"Server ready.")
+                    {
+                        let _ = ready_sender.send(());
+                        ready_sent = true;
+                    }
+                    output.extend_from_slice(&line);
+                }
+                Err(error) => {
+                    output.extend_from_slice(
+                        format!("\nfailed to capture serve stderr: {error}\n").as_bytes(),
+                    );
+                    break;
+                }
+            }
+        }
+        output
+    });
+    (ready_receiver, reader)
+}
+
+fn collect_output(child: Child, stderr_reader: JoinHandle<Vec<u8>>) -> Output {
+    let mut output = child.wait_with_output().expect("collect child output");
+    output.stderr = stderr_reader.join().expect("join serve stderr reader");
+    output
+}
+
+fn wait_with_timeout(
+    mut child: Child,
+    stderr_reader: JoinHandle<Vec<u8>>,
+    timeout: Duration,
+) -> Output {
     let start = Instant::now();
     loop {
         if child.try_wait().expect("poll child").is_some() {
-            return child.wait_with_output().expect("collect child output");
+            return collect_output(child, stderr_reader);
         }
         if start.elapsed() >= timeout {
             let pid = child.id();
@@ -75,9 +127,7 @@ fn wait_with_timeout(mut child: Child, timeout: Duration) -> Output {
                     .expect("poll child after SIGTERM")
                     .is_some()
                 {
-                    let output = child
-                        .wait_with_output()
-                        .expect("collect timed-out child output");
+                    let output = collect_output(child, stderr_reader);
                     assert_eq!(
                         output.status.code(),
                         Some(130),
@@ -97,9 +147,7 @@ fn wait_with_timeout(mut child: Child, timeout: Duration) -> Output {
                 .status()
                 .expect("send SIGKILL with kill");
             assert!(status.success(), "kill -KILL {pid} failed: {status}");
-            let output = child
-                .wait_with_output()
-                .expect("collect force-killed child output");
+            let output = collect_output(child, stderr_reader);
             assert_eq!(
                 output.status.code(),
                 Some(130),
@@ -117,7 +165,7 @@ fn wait_with_timeout(mut child: Child, timeout: Duration) -> Output {
 
 #[test]
 fn serve_sigint_returns_through_main_and_preserves_reopenable_db() {
-    let temp = TempDir::new().expect("tempdir");
+    let temp = TempDir::new_in(isolated_temp_root()).expect("isolated tempdir");
     let root = temp.path();
 
     assert_success(
@@ -143,7 +191,16 @@ fn serve_sigint_returns_through_main_and_preserves_reopenable_db() {
         .spawn()
         .expect("spawn br serve");
 
-    thread::sleep(Duration::from_millis(200));
+    let (ready_receiver, stderr_reader) = capture_stderr_until_exit(&mut child);
+    if let Err(error) = ready_receiver.recv_timeout(Duration::from_secs(5)) {
+        let _ = child.kill();
+        let output = collect_output(child, stderr_reader);
+        panic!(
+            "br serve did not report ready within 5s: {error}\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
     assert!(
         child.try_wait().expect("poll br serve").is_none(),
         "br serve exited before SIGINT"
@@ -154,7 +211,7 @@ fn serve_sigint_returns_through_main_and_preserves_reopenable_db() {
     if let Some(mut stdin) = child.stdin.take() {
         stdin.flush().expect("flush serve stdin");
     }
-    let output = wait_with_timeout(child, Duration::from_secs(5));
+    let output = wait_with_timeout(child, stderr_reader, Duration::from_secs(5));
 
     assert_eq!(
         output.status.code(),

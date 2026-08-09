@@ -31,6 +31,21 @@ guards.
 
 All file I/O is confined to the `.beads/` directory by default.
 
+Mutating operations coordinate through `.beads/.write.lock` and stable,
+hash-derived `.br-db-write-<24 lowercase hex>.lock` and
+`.br-jsonl-write-<24 lowercase hex>.lock` sidecars. These empty authority files
+remain in `.beads/` so independent processes lock the same inode; they are not
+temporary sync payloads.
+
+JSONL issue rows may also carry an optional positive `sequence_number`. The
+full issue ID remains the identity used for merge and reconciliation;
+`sequence_number` is repository-local lookup metadata. SQLite stores the
+issue-to-sequence mapping in `issue_sequences` and the next unallocated value
+in `id_counters`. Export preserves mappings, and import advances the counter
+past every observed value so locally allocated values are never reused. An
+import may contain the same sequence on multiple full IDs; in that case numeric
+shorthand is intentionally ambiguous and callers must use a full ID.
+
 ---
 
 ## What br sync Will NEVER Do
@@ -127,6 +142,13 @@ arbitrary daemonized descendants. No sync mode calls or delegates to it.
 | **Projected-cycle check** | Newly introducing a blocking or parent-child dependency cycle | **None** |
 | **Source/database witness recheck** | Applying a plan after either side changed | **None** - regenerate the plan |
 
+The additive database witness includes both sequence tables. A reviewed apply
+binds imported sequence metadata to the same source and database witnesses as
+the issue rows, and rolls back the transaction if the resulting
+`issue_sequences` or `id_counters` state differs from the plan. Three-way merge
+likewise includes sequence changes in its reviewed intent and core database
+witness; sequence metadata never substitutes for exact-ID identity.
+
 ---
 
 ## Using --force Safely
@@ -217,7 +239,7 @@ br sync --reconcile-additive --apply \
 ```
 
 The dry-run opens the current-schema database read-only and does not take the
-writer lock. Its v2 receipt includes an exact `plan_sha256`. The apply path
+writer lock. Its v3 receipt includes an exact `plan_sha256`. The apply path
 requires that token, takes `.beads/.write.lock`, rebuilds the identically
 configured plan, and rejects a mismatch before mutation. It rechecks exact JSONL
 bytes plus canonical content, size, mtime, issue payload, all relation rows,
@@ -352,6 +374,10 @@ The safety model is backed by an extensive test suite that ensures these guarant
 - **Fail-closed source validation** (`SyncSafetyValidator::validate_no_git_authority_in_sync_sources`): recursively scans both `src/sync/**/*.rs` and `src/cli/commands/sync.rs`, rejecting subprocess construction, inclusion escape hatches, Git libraries, process-capable CLI delegation, missing/unreadable/non-UTF-8 paths, symlinks, and unsupported special filesystem entries; a parsed Cargo-manifest check rejects direct normal and target-runtime Git-library edges, while `cargo tree -e normal` is the separate transitive runtime-closure gate
 - **Atomic write tests** (`e2e_sync_failure_injection.rs`): Tests inject failures mid-export to verify the original file is preserved
 - **Conflict marker tests**: Import preflight tests verify that merge conflicts are detected and rejected
+- **Sequence metadata tests** (`jsonl_import_export.rs`, `e2e_slug.rs`): Verify
+  positive integer validation, counter advancement/non-reuse, duplicate
+  ambiguity, round-trip export/import, additive reconciliation, and three-way
+  merge of sequence-only JSONL changes
 
 ### How Logging Aids Diagnosis
 
@@ -394,9 +420,9 @@ executable. The maintained evidence consists of:
 ## Further Reading
 
 For technical details, see:
-- `.beads/SYNC_THREAT_MODEL.md` - Incident analysis and failure scenarios
-- `.beads/SYNC_SAFETY_INVARIANTS.md` - Testable safety invariants
-- `.beads/SYNC_CLI_FLAG_SEMANTICS.md` - Flag matrix and opt-in rules
+- [SYNC_THREAT_MODEL.md](SYNC_THREAT_MODEL.md) - Incident analysis and failure scenarios
+- [SYNC_SAFETY_INVARIANTS.md](SYNC_SAFETY_INVARIANTS.md) - Testable safety invariants
+- [SYNC_CLI_FLAG_SEMANTICS.md](SYNC_CLI_FLAG_SEMANTICS.md) - Flag matrix and opt-in rules
 
 ---
 

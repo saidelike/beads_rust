@@ -405,6 +405,8 @@
                 "conditional-blocks",
                 "waits-for",
                 "related",
+                "derived-from",
+                "implements",
                 "discovered-from",
                 "replies-to",
                 "relates-to",

@@ -13,6 +13,7 @@ The e2e sync test suite verifies several critical safety properties:
 5. **No Partial Writes** - Failed operations leave state unchanged
 6. **Lossless Additive Recovery** - Dry-run is read-only; token-bound apply preserves DB-only rows, audit/close/gate evidence, JSONL bytes, and relation identity
 7. **Fail-Closed Review** - Mismatched/stale plan tokens, unreviewed scalar drift, lossy JSON, and relation drift roll back without partial state
+8. **Sequence Metadata Integrity** - Optional positive sequence numbers round-trip, advance the non-reusing local counter, remain exact-ID metadata, and participate in merge/reconcile witnesses
 
 ## Test Files
 
@@ -26,6 +27,8 @@ The e2e sync test suite verifies several critical safety properties:
 | `tests/e2e_sync_preflight_integration.rs` | Preflight checks catch safety issues before writes |
 | `tests/e2e_sync_reconcile.rs` | Additive `--reconcile`: false-equal repair, event preservation, dry-run zero-mutation, witness rollback |
 | `tests/e2e_basic_lifecycle.rs` | Additive dry-run/apply/idempotency receipt, event preservation, and unchanged-source coverage |
+| `tests/e2e_slug.rs` | Templated ID creation, numeric shorthand, and sequence-only three-way merge |
+| `tests/jsonl_import_export.rs` | Sequence validation, duplicate ambiguity, counter advancement, JSONL round-trip, and reconcile preservation |
 
 ## Running the Tests
 
@@ -34,7 +37,8 @@ The e2e sync test suite verifies several critical safety properties:
 ```bash
 # Run every dedicated sync/VCS E2E target. Cargo's positional test filter does
 # not select integration-test target names, so name each target explicitly.
-cargo test --release \
+./scripts/with-build-limits.sh env CARGO_BUILD_JOBS=2 \
+  cargo test --release \
   --test e2e_sync_git_safety \
   --test e2e_sync_status_health \
   --test e2e_vcs_status \
@@ -49,24 +53,31 @@ cargo test --release \
 
 ```bash
 # Git safety regression tests
-cargo test --test e2e_sync_git_safety --release
+./scripts/with-build-limits.sh env CARGO_BUILD_JOBS=2 \
+  cargo test --test e2e_sync_git_safety --release
 
 # Artifact preservation tests (detailed logging)
-cargo test --test e2e_sync_artifacts --release
+./scripts/with-build-limits.sh env CARGO_BUILD_JOBS=2 \
+  cargo test --test e2e_sync_artifacts --release
 
 # Fuzz and edge case tests
-cargo test --test e2e_sync_fuzz_edge_cases --release
+./scripts/with-build-limits.sh env CARGO_BUILD_JOBS=2 \
+  cargo test --test e2e_sync_fuzz_edge_cases --release
 
 # Failure injection tests
-cargo test --test e2e_sync_failure_injection --release
+./scripts/with-build-limits.sh env CARGO_BUILD_JOBS=2 \
+  cargo test --test e2e_sync_failure_injection --release
 
 # Preflight integration tests
-cargo test --test e2e_sync_preflight_integration --release
+./scripts/with-build-limits.sh env CARGO_BUILD_JOBS=2 \
+  cargo test --test e2e_sync_preflight_integration --release
 
 # Additive reconcile tests (br sync --reconcile / --dry-run)
-cargo test --test e2e_sync_reconcile --release
+./scripts/with-build-limits.sh env CARGO_BUILD_JOBS=2 \
+  cargo test --test e2e_sync_reconcile --release
 # Additive recovery with command-level logs retained by BrWorkspace
-RUST_LOG=beads_rust=debug cargo test --test e2e_basic_lifecycle \
+./scripts/with-build-limits.sh env CARGO_BUILD_JOBS=2 \
+  RUST_LOG=beads_rust=debug cargo test --test e2e_basic_lifecycle \
   e2e_sync_additive_reconciliation_is_read_only_then_lossless_and_idempotent \
   --release -- --nocapture
 ```
@@ -75,10 +86,12 @@ RUST_LOG=beads_rust=debug cargo test --test e2e_basic_lifecycle \
 
 ```bash
 # Run a specific test by name
-cargo test regression_sync_export_does_not_create_commits --release -- --nocapture
+./scripts/with-build-limits.sh env CARGO_BUILD_JOBS=2 \
+  cargo test regression_sync_export_does_not_create_commits --release -- --nocapture
 
 # Run tests matching a pattern
-cargo test conflict_marker --release -- --nocapture
+./scripts/with-build-limits.sh env CARGO_BUILD_JOBS=2 \
+  cargo test conflict_marker --release -- --nocapture
 ```
 
 ### Debug Mode
@@ -86,7 +99,8 @@ cargo test conflict_marker --release -- --nocapture
 For debugging the safety-contract targets, omit `--release`:
 
 ```bash
-cargo test \
+./scripts/with-build-limits.sh env CARGO_BUILD_JOBS=2 \
+  cargo test \
   --test e2e_sync_git_safety \
   --test e2e_sync_status_health \
   --test e2e_vcs_status \
@@ -235,8 +249,9 @@ The companion fail-closed unit gate
 non-UTF-8, symlinked, or special source-tree entries fail the gate, as do
 direct subprocess construction, inclusion escape hatches, Git libraries, and
 delegation to process-capable CLI adapters. The focused command
-`cargo test --lib 'validation::tests::sync_safety_' -- --nocapture` selects the
-real-tree check, parsed dependency-policy guard, and every adversarial fixture.
+`./scripts/with-build-limits.sh env CARGO_BUILD_JOBS=2 cargo test --lib
+'validation::tests::sync_safety_' -- --nocapture` selects the real-tree check,
+parsed dependency-policy guard, and every adversarial fixture.
 
 The central authority matrix invokes all operation dispatches, human/JSON
 status, additive plan/apply, all three merge-winner flags, manifest export,
@@ -271,8 +286,10 @@ deadline-aware between bounded reads; an individual filesystem read cannot be
 preempted, and cleanup may extend past the probe budget. Run both surfaces explicitly:
 
 ```bash
-cargo test --lib 'cli::commands::vcs::tests' -- --nocapture
-cargo test --test e2e_vcs_status -- --nocapture
+./scripts/with-build-limits.sh env CARGO_BUILD_JOBS=2 \
+  cargo test --lib 'cli::commands::vcs::tests' -- --nocapture
+./scripts/with-build-limits.sh env CARGO_BUILD_JOBS=2 \
+  cargo test --test e2e_vcs_status -- --nocapture
 ```
 
 The selected Git executable is trusted after its ambient execution features
@@ -349,6 +366,26 @@ Tests the additive `br sync --reconcile` mode (beads_rust-3r45):
 - Write-lock contention fails apply cleanly; read-only dry-run proceeds
 - External JSONL path policy, read-only JSONL, empty DB/JSONL, 2K+ row bulk
 
+### 7. Issue Sequence Metadata Tests
+
+`tests/jsonl_import_export.rs` verifies that `sequence_number` remains a JSON
+integer, round-trips through `issue_sequences`, and advances `id_counters`
+without reuse. It also covers non-positive rejection, successor overflow,
+skipped imports, additive reconciliation, and duplicate values. Duplicate
+values are valid metadata on distinct exact IDs, but numeric lookup must report
+ambiguity.
+
+`tests/e2e_slug.rs::e2e_three_way_merge_preserves_sequence_only_jsonl_change`
+proves a reviewed merge can apply a sequence-only JSONL change and subsequently
+resolve its unique numeric shorthand. The merge intent and database witnesses
+include `issue_sequences` and `id_counters`; the sequence never replaces the
+full ID as merge identity.
+
+These witness additions are published as additive receipt schema
+`br.sync.additive-reconciliation.v3`. Apply rejects v2, future, or otherwise
+mismatched receipt schemas before checking the plan token or opening a write
+transaction.
+
 ## Troubleshooting
 
 ### Test Fails with "SAFETY VIOLATION"
@@ -364,7 +401,9 @@ This indicates a genuine safety regression. Steps:
 
 ```bash
 # Run with timeout
-timeout 120 cargo test --release --test e2e_sync_git_safety --test e2e_sync_status_health --test e2e_vcs_status
+./scripts/with-build-limits.sh env CARGO_BUILD_JOBS=2 \
+  timeout 120 cargo test --release --test e2e_sync_git_safety \
+  --test e2e_sync_status_health --test e2e_vcs_status
 
 # Check for lock contention
 lsof +D /tmp/tmp.* 2>/dev/null | grep -E '\.db'
@@ -379,7 +418,8 @@ Some tests (failure injection) require filesystem permission manipulation:
 ls -la /tmp/
 
 # Some CI environments may restrict this - check stderr for details
-cargo test --test e2e_sync_failure_injection -- --nocapture
+./scripts/with-build-limits.sh env CARGO_BUILD_JOBS=2 \
+  cargo test --test e2e_sync_failure_injection -- --nocapture
 ```
 
 ### Flaky Tests
@@ -389,7 +429,9 @@ If tests pass/fail intermittently:
 1. Check for race conditions in parallel test execution
 2. Run with `--test-threads=1`:
    ```bash
-   cargo test --release --test e2e_sync_git_safety --test e2e_sync_status_health --test e2e_vcs_status -- --test-threads=1
+   ./scripts/with-build-limits.sh env CARGO_BUILD_JOBS=2 \
+     cargo test --release --test e2e_sync_git_safety \
+     --test e2e_sync_status_health --test e2e_vcs_status -- --test-threads=1
    ```
 
 ### "Command not found: br"
@@ -398,7 +440,7 @@ Tests require the `br` binary to be built:
 
 ```bash
 # Ensure binary is built
-cargo build --release
+./scripts/with-build-limits.sh env CARGO_BUILD_JOBS=2 cargo build --release
 
 # Verify binary exists
 ls -la target/release/br
@@ -450,7 +492,7 @@ For CI pipelines:
 
 ## Shell harnesses
 
-`tests/e2e_scripts/sync_safety_witness.sh` — runs `br sync --flush-only` and `br sync --import-only --force` against a fresh workspace, captures every filesystem mutation (via `strace` on Linux when available, polling-snapshot fallback otherwise), and asserts each mutation is in the PC-1 / PC-RECOVERY allowlist. Emits a structured JSONL event log to `/tmp/sync_safety_witness_<UTC-ts>.jsonl` with one event per filesystem op (`{ts, op, path, allowed, reason_if_blocked}`).
+`tests/e2e_scripts/sync_safety_witness.sh` — runs `br sync --flush-only` and `br sync --import-only --force` against a fresh workspace, captures every filesystem mutation (via `strace` on Linux when available, polling-snapshot fallback otherwise), and asserts each mutation is in the PC-1 / PC-AUTHORITY / PC-RECOVERY allowlist. Stable database/JSONL authority sidecars are accepted only when their names contain the exact 24-character lowercase hexadecimal identity. The harness emits a structured JSONL event log to `/tmp/sync_safety_witness_<UTC-ts>.jsonl` with one event per filesystem op (`{ts, op, path, allowed, reason_if_blocked}`).
 
 ```bash
 # Run locally (needs cargo build --release first, or set BR_BIN=path/to/br)
@@ -468,6 +510,6 @@ Exit codes:
 ## Related Documentation
 
 - [SYNC_SAFETY.md](SYNC_SAFETY.md) - Sync safety model and design
-- `.beads/SYNC_SAFETY_INVARIANTS.md` - Safety invariants specification (PC-1, PC-3, PC-RECOVERY, NGI-3, ...)
-- `.beads/SYNC_CLI_FLAG_SEMANTICS.md` - CLI flag behavior
-- `.beads/SYNC_THREAT_MODEL.md` - Threat model for sync operations
+- [SYNC_SAFETY_INVARIANTS.md](SYNC_SAFETY_INVARIANTS.md) - Safety invariants specification (PC-1, PC-3, PC-RECOVERY, NGI-3, ...)
+- [SYNC_CLI_FLAG_SEMANTICS.md](SYNC_CLI_FLAG_SEMANTICS.md) - CLI flag behavior
+- [SYNC_THREAT_MODEL.md](SYNC_THREAT_MODEL.md) - Threat model for sync operations

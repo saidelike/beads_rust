@@ -44,18 +44,18 @@ static BV_VERSION_RE: LazyLock<Regex> = LazyLock::new(|| {
 });
 static GRAPH_ROOT_FIRST_USAGE_HINT_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
-        r#""usage_hints"\s*:\s*\[\s*"--graph-root (?:\\u003c|<)id(?:\\u003e|>) - [^"]+",\s*"#,
+        r#""usage_hints"\s*:\s*\[\s*"(?:--graph-root (?:\\u003c|<)id(?:\\u003e|>)|--brief) - [^"]+",\s*"#,
     )
     .expect("first graph-root usage hint regex")
 });
 static GRAPH_ROOT_ONLY_USAGE_HINT_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
-        r#""usage_hints"\s*:\s*\[\s*"--graph-root (?:\\u003c|<)id(?:\\u003e|>) - [^"]+"\s*\]"#,
+        r#""usage_hints"\s*:\s*\[\s*"(?:--graph-root (?:\\u003c|<)id(?:\\u003e|>)|--brief) - [^"]+"\s*\]"#,
     )
     .expect("only graph-root usage hint regex")
 });
 static GRAPH_ROOT_LATER_USAGE_HINT_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#",\s*"--graph-root (?:\\u003c|<)id(?:\\u003e|>) - [^"]+""#)
+    Regex::new(r#",\s*"(?:--graph-root (?:\\u003c|<)id(?:\\u003e|>)|--brief) - [^"]+""#)
         .expect("later graph-root usage hint regex")
 });
 /// `data_hash` is bv's content fingerprint of the beads data it read. It is a
@@ -187,29 +187,33 @@ fn normalize_bv_robot_output(raw: &str) -> String {
 }
 
 #[test]
-fn normalize_bv_usage_hints_removes_graph_root_hint_in_any_array_position() {
-    let graph_root = r#""--graph-root \u003cid\u003e - Scope triage""#;
-    let cases = [
-        (
-            format!(r#"{{"usage_hints":[{graph_root}]}}"#),
-            r#"{"usage_hints":[]}"#,
-        ),
-        (
-            format!(r#"{{"usage_hints":[{graph_root},"keep"]}}"#),
-            r#"{"usage_hints":["keep"]}"#,
-        ),
-        (
-            format!(r#"{{"usage_hints":["keep",{graph_root}]}}"#),
-            r#"{"usage_hints":["keep"]}"#,
-        ),
-        (
-            format!(r#"{{"usage_hints":["a",{graph_root},"b"]}}"#),
-            r#"{"usage_hints":["a","b"]}"#,
-        ),
-    ];
+fn normalize_bv_usage_hints_removes_versioned_hints_in_any_array_position() {
+    for volatile_hint in [
+        r#""--graph-root \u003cid\u003e - Scope triage""#,
+        r#""--brief - Compact output""#,
+    ] {
+        let cases = [
+            (
+                format!(r#"{{"usage_hints":[{volatile_hint}]}}"#),
+                r#"{"usage_hints":[]}"#,
+            ),
+            (
+                format!(r#"{{"usage_hints":[{volatile_hint},"keep"]}}"#),
+                r#"{"usage_hints":["keep"]}"#,
+            ),
+            (
+                format!(r#"{{"usage_hints":["keep",{volatile_hint}]}}"#),
+                r#"{"usage_hints":["keep"]}"#,
+            ),
+            (
+                format!(r#"{{"usage_hints":["a",{volatile_hint},"b"]}}"#),
+                r#"{"usage_hints":["a","b"]}"#,
+            ),
+        ];
 
-    for (raw, expected) in cases {
-        assert_eq!(normalize_bv_usage_hints(&raw), expected);
+        for (raw, expected) in cases {
+            assert_eq!(normalize_bv_usage_hints(&raw), expected);
+        }
     }
 }
 

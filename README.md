@@ -57,12 +57,19 @@ You need to track issues for your project, but:
 
 ```bash
 br init                              # Initialize in your repo
+br init --redirect                   # Share the primary worktree's tracker
 br create "Fix login timeout" -p 1   # Create high-priority issue
 br ready                             # See what's actionable
 br coordination status --json        # Inspect hidden in-progress claims
 br close br-abc123                   # Close when done; JSONL auto-flushes by default
 br sync --flush-only                 # Optional final export check before git commit
 ```
+
+For linked worktrees, redirect the secondary worktree to the primary
+worktree's complete tracker instead of creating another database. See
+[Shared br Workspaces Across Git Worktrees](docs/WORKTREE_REDIRECTS.md) for
+safe adoption, default Codex SessionStart routing, Claude/Worktrunk
+integration, and explicit raw-Git hook activation.
 
 ### Why br?
 
@@ -204,6 +211,7 @@ br show br-abc123 --json
 br capabilities --format json
 br capabilities --format json --command "create"
 br robot-docs guide
+br roadmap br-map --format json
 ```
 
 For routine operator or agent use, prefer `RUST_LOG=error br ...` to suppress internal Rust dependency logs while preserving normal stdout/JSON output:
@@ -587,6 +595,13 @@ br uses layered configuration:
 id:
   prefix: "proj"
 
+# Optional taskmd-like issue IDs for new issues. Default mode remains
+# generated (`<prefix>-<hash>` or `<prefix>-<slug>-<hash>`).
+id_generation:
+  mode: templated
+  template: "{seq:03}-{slug}-{hash}"
+  require_slug: true
+
 # Default values for new issues
 defaults:
   priority: 2
@@ -646,6 +661,58 @@ workflow:
 - `br ready` (text/json/toon/robot) and `br scheduler` all honor the group.
 
 See `docs/CLI_REFERENCE.md` (the `ready` command) for full details.
+
+`br capabilities --format json` reports issue-type acceptance separately from
+behavioral registrations. Under `issue_types`, `standard_types` contains the
+canonical standard syntax, `accepts_custom_types` reports the open custom-string
+domain, `active_profiles` names merged profiles, and `types` contains only
+behavior-bearing registrations. Omission from `types` means neutral behavior,
+not invalid syntax; `epic` intentionally appears as both standard syntax and a
+built-in registration.
+
+The same policy file can add or override capability registrations. The optional
+`matt-skills` profile provides the Map → Spec → implementation vocabulary while
+leaving projects that do not enable it unchanged:
+
+```yaml
+issue_types:
+  profiles: [matt-skills]
+  # Project definitions extend the profile or override individual fields.
+  types:
+    - name: research
+      # Presentation role is independent from behavioral capabilities.
+      roadmap_role: decision
+      capabilities:
+        ready_work: false
+    - name: publication
+      roadmap_role: specification
+```
+
+The profile registers `map`, `research`, `grilling`, `prototype`, `spec`, and
+`implementation`, assigning roadmap roles `authority`, `decision`,
+`specification`, and `implementation` respectively. Project definitions may
+override a profile role or assign one to a custom type without changing that
+type's readiness or closure behavior. Native `task` remains prerequisite work
+and native `bug` remains defect work. A Map is an aggregate strategic context
+root: it is absent
+from `br ready` and is not blocked merely by open children. A Spec is an
+aggregate publication artifact that can close normally while implementation
+children remain open. The other profile types are leaf work unless an issue
+actually has children.
+
+Use `br roadmap <root>` to compose containment with the non-execution
+`derived-from` and `implements` traceability relations, including directly
+related issue summaries. `br capabilities --format json` exposes the merged,
+validated acceptance and registration contract for adapters.
+
+Types describe outcomes. Labels such as `ready-for-agent` and
+`ready-for-human` route the next actor or record orthogonal concerns. Native
+parent-child and blocking edges remain the authorities for hierarchy and causal
+execution order; roadmap traceability records provenance and realization but
+never changes readiness or scheduling. The profile does not add `wayfinder:*`
+methodology labels, enforce
+title/body templates or hierarchy prose, launch agents, operate Git, or dispatch
+CI. Those concerns remain with skills, adapters, and external orchestration.
 
 The same policy file can enforce **atomic repository-level workflow capacity**.
 Hard limits are checked inside the same `BEGIN IMMEDIATE` transaction that

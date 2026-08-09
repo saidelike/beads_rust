@@ -21,6 +21,7 @@
 
 mod common;
 
+use beads_rust::storage::schema::CURRENT_SCHEMA_VERSION;
 use common::cli::{BrWorkspace, extract_json_payload, run_br};
 use flate2::read::GzDecoder;
 use serde_json::Value;
@@ -80,6 +81,8 @@ fn upgrade_fixture_end_to_end(
     expected_from: u64,
     expected_issue_total: u64,
 ) {
+    let current_schema_version =
+        u32::try_from(CURRENT_SCHEMA_VERSION).expect("current schema version must fit u32");
     let workspace = BrWorkspace::new();
     install_fixture_workspace(&workspace, db_gz, issues, config);
     let db_path = workspace.root.join(".beads").join("beads.db");
@@ -133,13 +136,16 @@ fn upgrade_fixture_end_to_end(
         "{label}: plan not eligible"
     );
     assert_eq!(plan_json["from_version"].as_u64(), Some(expected_from));
-    assert_eq!(plan_json["to_version"].as_u64(), Some(17));
+    assert_eq!(
+        plan_json["to_version"].as_u64(),
+        Some(u64::from(current_schema_version))
+    );
     let plan_token = plan_json["plan_token"]
         .as_str()
         .expect("plan token")
         .to_string();
 
-    // 3. Apply migrates atomically to schema 17.
+    // 3. Apply migrates atomically to the current schema.
     let apply = run_br(
         &workspace,
         [
@@ -165,7 +171,7 @@ fn upgrade_fixture_end_to_end(
     let run_id = applied_json["run_id"].as_str().expect("run id").to_string();
     assert_eq!(
         header_user_version(&db_path),
-        17,
+        current_schema_version,
         "{label}: post-apply schema"
     );
     for table in [
@@ -173,6 +179,8 @@ fn upgrade_fixture_end_to_end(
         "capacity_exemptions",
         "capacity_exemption_history",
         "capacity_occupancy",
+        "id_counters",
+        "issue_sequences",
     ] {
         assert!(
             db_declares_table(&db_path, table),
@@ -264,7 +272,7 @@ fn upgrade_fixture_end_to_end(
     );
     assert_eq!(
         header_user_version(&db_path),
-        17,
+        current_schema_version,
         "{label}: rejected stale apply must not mutate the database"
     );
 
@@ -339,7 +347,7 @@ fn upgrade_fixture_end_to_end(
         apply2.stdout,
         apply2.stderr
     );
-    assert_eq!(header_user_version(&db_path), 17);
+    assert_eq!(header_user_version(&db_path), current_schema_version);
 }
 
 /// Schema 15 (gate-history era, pre-#384) upgrades to the current schema.

@@ -104,6 +104,12 @@ pub struct GitPathIdentity {
     pub object_id: String,
 }
 
+#[derive(Debug)]
+enum ParsedHeadIdentity {
+    Absent,
+    Present(GitPathIdentity),
+}
+
 /// Exact identity of one unmerged index stage.
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, JsonSchema)]
 pub struct GitIndexStage {
@@ -599,16 +605,20 @@ fn read_head_identity(
     if !output.status.success() {
         return Err(CollectionFailure::Semantic("probe_failed"));
     }
-    parse_head_identity(&output.stdout, object_format)
-        .ok_or(CollectionFailure::Semantic("probe_failed"))
+    match parse_head_identity(&output.stdout, object_format)
+        .ok_or(CollectionFailure::Semantic("probe_failed"))?
+    {
+        ParsedHeadIdentity::Absent => Ok(None),
+        ParsedHeadIdentity::Present(identity) => Ok(Some(identity)),
+    }
 }
 
 fn parse_head_identity(
     output: &[u8],
     object_format: GitObjectFormat,
-) -> Option<Option<GitPathIdentity>> {
+) -> Option<ParsedHeadIdentity> {
     if output.is_empty() {
-        return Some(None);
+        return Some(ParsedHeadIdentity::Absent);
     }
     let records = split_nul_records(output)?;
     if records.len() != 1 {
@@ -622,7 +632,7 @@ fn parse_head_identity(
     if fields.len() != 3 {
         return None;
     }
-    Some(Some(GitPathIdentity {
+    Some(ParsedHeadIdentity::Present(GitPathIdentity {
         mode: parse_git_mode(fields[0])?,
         object_type: parse_object_type(fields[1])?,
         object_id: parse_object_id(fields[2], object_format)?,
@@ -787,7 +797,7 @@ fn hash_snapshot_with<D: Digest>(
     hasher.update(format!("blob {}\0", source.size()).as_bytes());
     let mut reader = source.reader();
     let mut remaining = source.size();
-    let mut buffer = [0_u8; 64 * 1024];
+    let mut buffer = vec![0_u8; 64 * 1024].into_boxed_slice();
     while remaining > 0 {
         if Instant::now() >= deadline {
             return Err(ProbeFailure::TimedOut);
@@ -1075,11 +1085,10 @@ fn read_core_autocrlf(
     )?;
     match output.status.code() {
         Some(1) => Ok(false),
-        Some(0) => match trim_ascii(&output.stdout).to_ascii_lowercase().as_slice() {
-            b"false" | b"no" | b"off" | b"0" => Ok(false),
-            b"true" | b"yes" | b"on" | b"1" | b"input" => Ok(true),
-            _ => Ok(true),
-        },
+        Some(0) => Ok(!matches!(
+            trim_ascii(&output.stdout).to_ascii_lowercase().as_slice(),
+            b"false" | b"no" | b"off" | b"0"
+        )),
         _ => Err(CollectionFailure::Semantic("probe_failed")),
     }
 }
@@ -1633,15 +1642,15 @@ fn worktree_state_label(value: Option<WorktreeState>) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::{
-        GitObjectFormat, ProbeFailure, attributes_require_transform, external_path_descriptor,
-        hardened_git_command, hash_snapshot_as_git_blob, is_git_process_environment_key,
-        parse_head_identity, parse_index_entries, parse_object_id, parse_single_ignored_match,
-        workspace_path_label,
+        GitObjectFormat, ParsedHeadIdentity, ProbeFailure, attributes_require_transform,
+        external_path_descriptor, hardened_git_command, hash_snapshot_as_git_blob,
+        is_git_process_environment_key, parse_head_identity, parse_index_entries, parse_object_id,
+        parse_single_ignored_match, workspace_path_label,
     };
     #[cfg(unix)]
     use super::{
         MAX_CAPTURE_BYTES_PER_STREAM, PathScope, ResolvedGitTarget, WorktreeState,
-        collect_git_export_status, run_git_probe_with_program,
+        collect_git_export_status, run_bounded_capture, run_git_probe_with_program,
     };
     use std::ffi::OsStr;
     #[cfg(unix)]
@@ -1675,15 +1684,17 @@ mod tests {
         let mut tree = b"100755 blob ".to_vec();
         tree.extend_from_slice(oid);
         tree.extend_from_slice(b"\t.beads/issues.jsonl\0");
-        let head = parse_head_identity(&tree, GitObjectFormat::Sha1)
-            .expect("valid tree record")
-            .expect("present tree record");
+        let head =
+            match parse_head_identity(&tree, GitObjectFormat::Sha1).expect("valid tree record") {
+                ParsedHeadIdentity::Present(identity) => identity,
+                ParsedHeadIdentity::Absent => panic!("expected present tree record"),
+            };
         assert_eq!(head.mode, "100755");
         assert_eq!(head.object_type, "blob");
 
         let mut index = b"100644 ".to_vec();
         index.extend_from_slice(oid);
-        index.extend_from_slice(b" 1\t.beads/issues.jsonl\0100755 ");
+        index.extend_from_slice(b" 1\t.beads/issues.jsonl\x00100755 ");
         index.extend_from_slice(oid);
         index.extend_from_slice(b" 2\t.beads/issues.jsonl\0");
         let parsed =
@@ -1872,18 +1883,13 @@ mod tests {
     #[test]
     fn probe_deadline_terminates_and_reaps_direct_child_with_bounded_capture() {
         let temp = TempDir::new().expect("temp dir");
-        let script = executable_script(
-            temp.path(),
-            "git-timeout",
-            "#!/bin/sh\nprintf 'started'\nprintf 'started' >&2\nwhile :; do :; done\n",
-        );
+        let mut command = Command::new("/bin/sh");
+        command.current_dir(temp.path()).args([
+            "-c",
+            "printf 'started'; printf 'started' >&2; while :; do :; done",
+        ]);
         let started = Instant::now();
-        let result = run_git_probe_with_program(
-            script.as_os_str(),
-            temp.path(),
-            &[],
-            started + Duration::from_millis(75),
-        );
+        let result = run_bounded_capture(&mut command, started + Duration::from_millis(75));
         assert_eq!(
             result.expect_err("flood must time out"),
             ProbeFailure::TimedOut
@@ -1935,7 +1941,7 @@ mod tests {
             result.expect_err("oversized output must be rejected"),
             ProbeFailure::OutputLimit
         );
-        assert!(MAX_CAPTURE_BYTES_PER_STREAM < 4096 * 32);
+        const { assert!(MAX_CAPTURE_BYTES_PER_STREAM < 4096 * 32) };
     }
 
     #[cfg(unix)]

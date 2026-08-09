@@ -1,7 +1,13 @@
+mod common;
+
 use assert_cmd::assert::OutputAssertExt;
 use std::collections::BTreeSet;
 use std::process::Command;
 use toon_rust::try_decode;
+
+fn isolated_tempdir() -> tempfile::TempDir {
+    tempfile::TempDir::new_in(common::cli::isolated_temp_root()).expect("create isolated temp dir")
+}
 
 fn extract_issues_array(stdout: &[u8]) -> Vec<serde_json::Value> {
     let payload: serde_json::Value = serde_json::from_slice(stdout).expect("list output json");
@@ -19,7 +25,7 @@ fn extract_issues_array(stdout: &[u8]) -> Vec<serde_json::Value> {
 /// This was added to fix GitHub issue #7 where --title-flag was used instead of --title
 #[test]
 fn test_create_with_title_flag() {
-    let temp = tempfile::tempdir().unwrap();
+    let temp = isolated_tempdir();
     let path = temp.path();
 
     let bin = assert_cmd::cargo::cargo_bin!("br");
@@ -57,7 +63,7 @@ fn test_create_with_title_flag() {
 /// Test that positional title and --title flag behave consistently
 #[test]
 fn test_create_positional_vs_title_flag() {
-    let temp = tempfile::tempdir().unwrap();
+    let temp = isolated_tempdir();
     let path = temp.path();
 
     let bin = assert_cmd::cargo::cargo_bin!("br");
@@ -101,7 +107,7 @@ fn test_create_positional_vs_title_flag() {
 
 #[test]
 fn test_create_rejects_positional_and_title_flag_together() {
-    let temp = tempfile::tempdir().unwrap();
+    let temp = isolated_tempdir();
     let path = temp.path();
 
     let bin = assert_cmd::cargo::cargo_bin!("br");
@@ -153,7 +159,7 @@ fn test_create_rejects_positional_and_title_flag_together() {
 
 #[test]
 fn test_create_json_output_includes_labels_and_deps() {
-    let temp = tempfile::tempdir().unwrap();
+    let temp = isolated_tempdir();
     let path = temp.path();
 
     let bin = assert_cmd::cargo::cargo_bin!("br");
@@ -222,7 +228,7 @@ fn test_create_json_output_includes_labels_and_deps() {
 
 #[test]
 fn test_create_toon_output_decodes_single_issue() {
-    let temp = tempfile::tempdir().unwrap();
+    let temp = isolated_tempdir();
     let path = temp.path();
 
     let bin = assert_cmd::cargo::cargo_bin!("br");
@@ -256,7 +262,7 @@ fn test_create_toon_output_decodes_single_issue() {
 
 #[test]
 fn test_create_file_empty_markdown_emits_empty_toon_array() {
-    let temp = tempfile::tempdir().unwrap();
+    let temp = isolated_tempdir();
     let path = temp.path();
     let markdown_path = path.join("empty.md");
 
@@ -297,7 +303,7 @@ fn test_create_file_empty_markdown_emits_empty_toon_array() {
 
 #[test]
 fn test_create_file_silent_outputs_only_ids() {
-    let temp = tempfile::tempdir().unwrap();
+    let temp = isolated_tempdir();
     let path = temp.path();
     let markdown_path = path.join("issues.md");
 

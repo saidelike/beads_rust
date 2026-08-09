@@ -123,36 +123,16 @@ fn execute_inner(
     beads_dir: &Path,
     preloaded_storage_ctx: Option<&config::OpenStorageResult>,
 ) -> Result<()> {
-    // beads_rust-750p: orphans must auto-import a newer JSONL before
-    // scanning issue state, so JSONL-only closures (e.g. from `git pull`)
-    // are reflected in the orphan list. We only do this on the
-    // non-preloaded path; the preloaded path was opened by main.rs
-    // (potentially in read_only_fast_open mode) and routes through its
-    // own auto-import probe in the startup phase.
-    //
-    // CONCURRENCY NOTE: We do NOT acquire the project's `.write.lock`
-    // explicitly here. This deviates from the audit/close/etc. flows in
-    // sibling commands which acquire the lock before opening writable.
-    // Rationale: orphans is on the read-only-fast-open list; main.rs's
-    // startup path (which DOES acquire the lock) is the canonical
-    // serialization point. The non-preloaded path is exercised in narrow
-    // cases (e.g. dispatch fallback, certain test harnesses) where the
-    // race is bounded by SQLite's per-connection locking. If two orphans
-    // invocations race the auto-import here, SQLite's WAL serializes the
-    // import write; the worst observable outcome is one waiting briefly
-    // for the other's transaction. This is acceptable for a read command
-    // and is documented at SYNC_SAFETY_INVARIANTS.md.
+    // beads_rust-750p: default orphans scans must auto-import a newer JSONL
+    // before reading issue state. Explicit read-only fast-open callers have
+    // already opted out with `--no-auto-import`; the shared helper returns
+    // before any staleness probe, so their connection remains read-only and
+    // does not join the writer-lock path.
     let owned_storage_ctx = if preloaded_storage_ctx.is_some() {
         None
     } else {
-        // Open with a writable cli (clear read_only_fast_open) so the
-        // auto-import probe + import can mutate the DB. Without this,
-        // the read-only fast-path connection raises "Bad file descriptor"
-        // when imports try to write.
-        let mut writable_cli = cli.clone();
-        writable_cli.read_only_fast_open = false;
-        let mut ctx_owned = config::open_storage_with_cli(beads_dir, &writable_cli)?;
-        crate::cli::commands::auto_import_storage_ctx_if_stale(&mut ctx_owned, &writable_cli)?;
+        let mut ctx_owned = config::open_storage_with_cli(beads_dir, cli)?;
+        crate::cli::commands::auto_import_storage_ctx_if_stale(&mut ctx_owned, cli)?;
         Some(ctx_owned)
     };
     let storage_ctx = preloaded_storage_ctx

@@ -38,7 +38,8 @@ pub struct SchemaWorkspace {
 
 impl SchemaWorkspace {
     pub fn new() -> Self {
-        let temp_dir = TempDir::new().expect("create temp dir");
+        let temp_dir =
+            TempDir::new_in(common::cli::isolated_temp_root()).expect("create isolated temp dir");
         let root = temp_dir.path().to_path_buf();
         let br_root = root.join("br_workspace");
         let bd_root = root.join("bd_workspace");

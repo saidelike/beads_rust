@@ -1,0 +1,67 @@
+{
+  "format": "br.schema-migration-fixtures.v1",
+  "generated_with": "sqlite3 3.45.1 direct DDL; gzip -n -9; no br binary or apply_schema",
+  "common_seed": {
+    "issues": ["bd-source", "bd-target"],
+    "blocks_created_at": "2026-08-05T05:06:07.123456789Z",
+    "blocks_metadata": null,
+    "blocks_thread_id": null,
+    "sequence_number": 42,
+    "next_sequence": 43
+  },
+  "fixtures": [
+    {
+      "file": "schema17_templates_pair.db.gz",
+      "sha256": "368800dc97f7644ac58e0a4f3de47d7fc7d1d3eb203a8bb610503a8bf05d8b77",
+      "schema_version": 17,
+      "dependency_identity": "pair-keyed",
+      "template_sequences": "canonical"
+    },
+    {
+      "file": "schema18_fork_templates_pair.db.gz",
+      "sha256": "54db0b30877fe7b2b133cdd26654d45eb423072ac7449de1b6a8edab725931c5",
+      "schema_version": 18,
+      "dependency_identity": "pair-keyed",
+      "template_sequences": "canonical"
+    },
+    {
+      "file": "schema18_upstream_typed.db.gz",
+      "sha256": "e1fe55910e10cb63b2fab2cf24476b3c578faed0db9686a80b1b9a58d24f2246",
+      "schema_version": 18,
+      "dependency_identity": "typed-keyed",
+      "template_sequences": "absent"
+    },
+    {
+      "file": "schema18_typed_templates.db.gz",
+      "sha256": "fea85849b0528b72807f5c8eed71ab45da331310e34d4815ffe7688d433d3b78",
+      "schema_version": 18,
+      "dependency_identity": "typed-keyed",
+      "template_sequences": "canonical"
+    },
+    {
+      "file": "schema19_typed_templates.db.gz",
+      "sha256": "b7b26b3e6c0c1df19707f5aa467795b520b3b2ac650034bab31cd5f7d5c508d6",
+      "schema_version": 19,
+      "dependency_identity": "typed-keyed",
+      "template_sequences": "canonical",
+      "injected_state": "dependencies_v18 canonical-no-op sentinel"
+    },
+    {
+      "file": "schema18_partial_templates.db.gz",
+      "sha256": "c265233561cdae80ce5ff360c98303680c1092ffbc385e1f6ee744bed4e98139",
+      "schema_version": 18,
+      "dependency_identity": "typed-keyed",
+      "template_sequences": "id_counters only",
+      "expected_result": "refused"
+    },
+    {
+      "file": "schema18_rebuild_collision.db.gz",
+      "sha256": "bd453a2fcd421cea92e8f58230fbf479143c412a53735c5a1565896d1fa0e593",
+      "schema_version": 18,
+      "dependency_identity": "pair-keyed",
+      "template_sequences": "canonical",
+      "injected_state": "dependencies_v18 rollback-witness sentinel",
+      "expected_result": "rolled back"
+    }
+  ]
+}

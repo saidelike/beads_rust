@@ -455,6 +455,7 @@ fn compute_summary(
             .iter()
             .filter(|i| {
                 is_potential_ready_candidate(i, now)
+                    && storage.type_participates_in_ready_work(i.issue_type.as_str())
                     && !dependency_blocked_ids.contains(&i.id)
                     && external_blockers.is_none_or(|eb| !eb.contains_key(&i.id))
             })

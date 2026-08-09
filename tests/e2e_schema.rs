@@ -7,8 +7,9 @@ mod common;
 
 use common::cli::{BrWorkspace, extract_json_payload, parse_created_id, run_br, run_br_with_env};
 use serde_json::Value;
+use std::fs;
 #[cfg(feature = "self_update")]
-use std::{fs, path::PathBuf};
+use std::path::PathBuf;
 #[cfg(feature = "self_update")]
 use toon_rust::options::KeyFoldingMode;
 use toon_rust::try_decode as parse_toon;
@@ -17,6 +18,9 @@ use toon_rust::{EncodeOptions, JsonValue};
 
 #[cfg(feature = "self_update")]
 const UPDATE_AGENT_BASELINE_ENV: &str = "UPDATE_AGENT_BASELINE";
+const STANDARD_ISSUE_TYPES: [&str; 7] = [
+    "task", "bug", "feature", "epic", "chore", "docs", "question",
+];
 
 #[test]
 fn e2e_schema_vcs_shape_matches_live_success_and_error_streams() {
@@ -61,6 +65,74 @@ fn e2e_schema_vcs_shape_matches_live_success_and_error_streams() {
     let error: Value = serde_json::from_str(&extract_json_payload(&error.stdout))
         .expect("VCS error JSON on stdout");
     assert!(error.get("error").is_some(), "{error}");
+}
+
+#[test]
+fn e2e_schema_redirect_shape_matches_live_refusal_stream() {
+    let _log = common::test_log("e2e_schema_redirect_shape_matches_live_refusal_stream");
+    let canonical = BrWorkspace::new();
+    let canonical_init = run_br(&canonical, ["init"], "schema_redirect_canonical_init");
+    assert!(
+        canonical_init.status.success(),
+        "canonical init failed: {}",
+        canonical_init.stderr
+    );
+
+    let local = BrWorkspace::new();
+    let local_init = run_br(&local, ["init"], "schema_redirect_local_init");
+    assert!(
+        local_init.status.success(),
+        "local init failed: {}",
+        local_init.stderr
+    );
+
+    let schemas = run_br(
+        &local,
+        ["schema", "commands", "--format", "json"],
+        "schema_redirect_commands",
+    );
+    assert!(schemas.status.success(), "{}", schemas.stderr);
+    let schemas: Value =
+        serde_json::from_str(&extract_json_payload(&schemas.stdout)).expect("schema commands JSON");
+    for command in ["init --redirect", "redirect set"] {
+        let shape = &schemas["commands"][command];
+        assert_eq!(
+            shape["error_envelope_on_stderr"], false,
+            "{command} must advertise the direct CLI refusal stream: {shape}"
+        );
+    }
+
+    let baseline_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("agent_baseline/schemas/schema_all.json");
+    let baseline: Value = serde_json::from_slice(&fs::read(&baseline_path).unwrap())
+        .expect("checked-in agent schema baseline JSON");
+    for command in ["init --redirect", "redirect set"] {
+        assert_eq!(
+            baseline["commands"][command]["error_envelope_on_stderr"], false,
+            "checked-in {command} contract must use the stdout refusal stream"
+        );
+    }
+
+    let target = canonical.root.join(".beads").canonicalize().unwrap();
+    let target = target.to_string_lossy().into_owned();
+    let refusal = run_br(
+        &local,
+        ["init", "--redirect", target.as_str(), "--json"],
+        "schema_redirect_live_refusal",
+    );
+    assert!(
+        !refusal.status.success(),
+        "initialized local state must refuse"
+    );
+    assert!(
+        refusal.stderr.is_empty(),
+        "structured redirect refusal must not use stderr: {}",
+        refusal.stderr
+    );
+    let refusal: Value = serde_json::from_str(&extract_json_payload(&refusal.stdout))
+        .expect("redirect refusal JSON on stdout");
+    assert_eq!(refusal["error"]["context"]["schema"], "br.redirect.v1");
+    assert_eq!(refusal["error"]["context"]["disposition"], "refused");
 }
 
 #[test]
@@ -190,6 +262,28 @@ fn e2e_capabilities_json_no_workspace() {
 
     assert_eq!(json["tool"], "br");
     assert_eq!(json["contract_version"], "br.capabilities.v1");
+    assert_eq!(
+        json["issue_types"]["standard_types"],
+        serde_json::json!(STANDARD_ISSUE_TYPES)
+    );
+    assert_eq!(json["issue_types"]["accepts_custom_types"], true);
+    assert_eq!(
+        json["issue_types"]["active_profiles"],
+        serde_json::json!([])
+    );
+    assert!(json["issue_types"]["types"]["epic"].is_object());
+    assert!(
+        json["issue_types"]["types"].get("task").is_none(),
+        "neutral standard types must not become registrations: {json}"
+    );
+
+    let standard_offset = payload.find("\"standard_types\"").unwrap();
+    let custom_offset = payload.find("\"accepts_custom_types\"").unwrap();
+    let profiles_offset = payload.find("\"active_profiles\"").unwrap();
+    let registrations_offset = payload.find("\"types\":").unwrap();
+    assert!(standard_offset < custom_offset);
+    assert!(custom_offset < profiles_offset);
+    assert!(profiles_offset < registrations_offset);
     assert!(
         json["features"].as_array().is_some_and(|features| {
             features
@@ -217,6 +311,75 @@ fn e2e_capabilities_json_no_workspace() {
         }),
         "missing exit-code contract: {json}"
     );
+}
+
+#[test]
+fn e2e_capabilities_toon_and_text_share_issue_type_acceptance_semantics() {
+    let _log =
+        common::test_log("e2e_capabilities_toon_and_text_share_issue_type_acceptance_semantics");
+    let workspace = BrWorkspace::new();
+
+    let toon = run_br(
+        &workspace,
+        ["capabilities", "--format", "toon"],
+        "capabilities_issue_types_toon",
+    );
+    assert!(toon.status.success(), "{}", toon.stderr);
+    let decoded = Value::from(parse_toon(toon.stdout.trim(), None).expect("valid TOON"));
+    let issue_types = &decoded["issue_types"];
+    assert_eq!(
+        issue_types["standard_types"],
+        serde_json::json!(STANDARD_ISSUE_TYPES)
+    );
+    assert_eq!(issue_types["accepts_custom_types"], true);
+    assert!(
+        issue_types["types.epic"].is_object() || issue_types["types"]["epic"].is_object(),
+        "TOON must preserve the Epic registration separately: {decoded}"
+    );
+
+    let text = run_br(
+        &workspace,
+        ["capabilities", "--format", "text"],
+        "capabilities_issue_types_text",
+    );
+    assert!(text.status.success(), "{}", text.stderr);
+    let acceptance = text.stdout.find("Issue type acceptance:").unwrap();
+    let standard = text
+        .stdout
+        .find("standard types: task, bug, feature, epic, chore, docs, question")
+        .unwrap();
+    let custom = text
+        .stdout
+        .find("custom types: accepted with neutral capabilities unless registered")
+        .unwrap();
+    let profiles = text.stdout.find("Active capability profiles:").unwrap();
+    let registrations = text
+        .stdout
+        .find("Issue type capability registrations:")
+        .unwrap();
+    assert!(acceptance < standard);
+    assert!(standard < custom);
+    assert!(custom < profiles);
+    assert!(profiles < registrations);
+}
+
+#[test]
+fn e2e_issue_type_capability_schema_requires_acceptance_fields() {
+    let _log = common::test_log("e2e_issue_type_capability_schema_requires_acceptance_fields");
+    let workspace = BrWorkspace::new();
+    let run = run_br(
+        &workspace,
+        ["schema", "issue-type-capabilities", "--format", "json"],
+        "schema_issue_type_acceptance",
+    );
+    assert!(run.status.success(), "{}", run.stderr);
+    let payload = extract_json_payload(&run.stdout);
+    let json: Value = serde_json::from_str(&payload).expect("schema JSON");
+    let schema = &json["schemas"]["TypeCapabilityRegistry"];
+    let required = schema["required"].as_array().expect("required fields");
+    assert!(required.iter().any(|field| field == "standard_types"));
+    assert!(required.iter().any(|field| field == "accepts_custom_types"));
+    assert!(schema["properties"]["types"].is_object());
 }
 
 #[test]
@@ -253,6 +416,42 @@ fn e2e_capabilities_command_detail_create_json() {
         }),
         "missing create argument metadata: {detail}"
     );
+    let type_argument = detail["arguments"]
+        .as_array()
+        .and_then(|arguments| {
+            arguments
+                .iter()
+                .find(|argument| argument["long"] == "--type")
+        })
+        .expect("create --type metadata");
+    assert_eq!(
+        type_argument["possible_values"],
+        serde_json::json!([]),
+        "create --type must remain an open string domain"
+    );
+
+    let init = run_br(
+        &workspace,
+        ["init", "--prefix", "br"],
+        "capabilities_custom_type_init",
+    );
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+
+    let create = run_br(
+        &workspace,
+        [
+            "create",
+            "Custom vocabulary",
+            "--type",
+            "unregistered-custom",
+            "--json",
+        ],
+        "capabilities_create_unregistered_custom_type",
+    );
+    assert!(create.status.success(), "create failed: {}", create.stderr);
+    let created: Value = serde_json::from_str(&extract_json_payload(&create.stdout))
+        .expect("custom-type create JSON");
+    assert_eq!(created["issue_type"], "unregistered-custom");
 }
 
 #[test]
@@ -875,7 +1074,14 @@ fn e2e_robot_docs_guide_text_is_concise() {
     assert!(lines <= 80, "guide should stay concise, got {lines} lines");
     assert!(run.stdout.contains("br capabilities --format json"));
     assert!(run.stdout.contains("br ready --json"));
-    assert!(run.stdout.contains("br never runs git"));
+    assert!(
+        run.stdout
+            .contains("Only an explicit br vcs-status request\n  may run Git")
+    );
+    assert!(
+        run.stdout
+            .contains("br sync does not commit, push, pull, or install hooks")
+    );
 }
 
 #[test]
@@ -1116,14 +1322,14 @@ fn run_success<const N: usize>(workspace: &BrWorkspace, args: [&str; N], label: 
 #[cfg(feature = "self_update")]
 fn compare_text_baseline(relative_path: &str, actual: &str) {
     let path = baseline_path(relative_path);
-    let actual = normalize_text_snapshot(actual);
+    let actual = normalize_agent_baseline_text(actual);
     if should_update_agent_baseline() {
         fs::write(&path, actual).expect("update agent baseline text snapshot");
         return;
     }
 
     let expected = fs::read_to_string(&path).expect("read agent baseline text snapshot");
-    let expected = normalize_text_snapshot(&expected);
+    let expected = normalize_agent_baseline_text(&expected);
     assert_eq!(
         expected, actual,
         "agent_baseline/{relative_path} is stale; rerun with {UPDATE_AGENT_BASELINE_ENV}=1"
@@ -1227,6 +1433,28 @@ fn normalize_text_snapshot(text: &str) -> String {
 }
 
 #[cfg(feature = "self_update")]
+fn normalize_agent_baseline_text(text: &str) -> String {
+    const OPTIONAL_MCP_HELP_ROW: &str =
+        "  serve         Start an MCP (Model Context Protocol) server on stdio";
+    let normalized = normalize_text_snapshot(text);
+    if !cfg!(feature = "mcp") {
+        return normalized;
+    }
+
+    // The checked-in agent baseline describes the default CLI surface. MCP is
+    // optional, and its dedicated feature-aware snapshot is covered in
+    // `tests/snapshots/cli_output.rs`; omit that one command row here so both
+    // default and `--all-features` validation compare against the same baseline.
+    let mut feature_neutral = normalized
+        .lines()
+        .filter(|line| *line != OPTIONAL_MCP_HELP_ROW)
+        .collect::<Vec<_>>()
+        .join("\n");
+    feature_neutral.push('\n');
+    feature_neutral
+}
+
+#[cfg(feature = "self_update")]
 fn normalize_schema_snapshot(value: &mut Value) {
     if let Some(object) = value.as_object_mut() {
         object.insert(
@@ -1241,6 +1469,9 @@ fn normalize_version_snapshot(value: &mut Value) {
     if let Some(object) = value.as_object_mut() {
         object.remove("branch");
         object.remove("commit");
+        if let Some(features) = object.get_mut("features").and_then(Value::as_array_mut) {
+            features.retain(|feature| feature.as_str() != Some("mcp"));
+        }
         for key in ["build", "rust_version", "target"] {
             if object.contains_key(key) {
                 object.insert(key.to_string(), Value::String(format!("<{key}>")));

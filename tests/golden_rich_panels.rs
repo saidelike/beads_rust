@@ -13,6 +13,12 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use tempfile::TempDir;
 
+#[allow(dead_code)]
+#[path = "common/cli.rs"]
+mod common_cli;
+
+use common_cli::isolated_temp_root;
+
 struct RichFixture {
     _temp_dir: TempDir,
     root: PathBuf,
@@ -100,7 +106,7 @@ fn create_issue(
 }
 
 fn init_fixture() -> RichFixture {
-    let temp_dir = TempDir::new().expect("temp dir");
+    let temp_dir = TempDir::new_in(isolated_temp_root()).expect("temp dir");
     let root = temp_dir.path().to_path_buf();
 
     run_setup_br(&root, &["init", "--prefix", "rich"]);

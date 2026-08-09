@@ -67,7 +67,10 @@ case "$stage" in
           .checks[]
           | select(.name == "write_lock")
           | select(.status == "ok")
-          | select(.details.reason == "persistent_advisory_inode")
+          | select(
+              .details.reason == "persistent_advisory_inode"
+              or .details.reason == "probe_would_block_live_holder"
+            )
           | select(.details.finding_id == "fm-concurrency_primitives-orphaned-write-lock")
         ' >/dev/null || {
             echo "ASSERT FAIL[$stage]: persistent MCP lock inode was not classified healthy" >&2

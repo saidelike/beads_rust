@@ -162,16 +162,26 @@ fn e2e_upgrade_dry_run_no_changes() {
     let workspace = BrWorkspace::new();
 
     let upgrade = run_br(&workspace, ["upgrade", "--dry-run"], "upgrade_dry_run");
-    // Should indicate dry-run mode
-    assert!(
-        upgrade.stdout.contains("dry-run")
-            || upgrade.stdout.contains("Dry-run")
-            || upgrade.stdout.contains("would")
-            || upgrade.stderr.contains("dry-run")
-            || upgrade.stderr.contains("Dry-run")
-            || upgrade.stderr.contains("NetworkError"),
-        "dry-run should indicate it's a dry run or show network error"
-    );
+    if upgrade.status.success() {
+        assert!(
+            upgrade.stdout.contains("dry-run")
+                || upgrade.stdout.contains("Dry-run")
+                || upgrade.stdout.contains("would"),
+            "successful dry-run should describe the preview: stdout={}, stderr={}",
+            upgrade.stdout,
+            upgrade.stderr
+        );
+    } else {
+        // Release discovery is network-backed. Any transport failure is
+        // normalized to the stable human-facing upgrade error rather than the
+        // self_update crate's internal `NetworkError` spelling.
+        assert!(
+            upgrade.stderr.contains("Upgrade failed:"),
+            "failed dry-run should report an upgrade error: stdout={}, stderr={}",
+            upgrade.stdout,
+            upgrade.stderr
+        );
+    }
 }
 
 #[cfg(feature = "self_update")]

@@ -6,7 +6,8 @@
 # Creates a workspace, runs `br sync --flush-only` and `br sync --import-only`,
 # and uses Linux strace (or fall back to inotifywait, or a polling stat scan
 # on macOS/other) to capture every filesystem mutation. Asserts each one is
-# in the allowlist defined by SYNC_SAFETY_INVARIANTS.md PC-1 / PC-RECOVERY.
+# in the allowlist defined by SYNC_SAFETY_INVARIANTS.md PC-1 / PC-AUTHORITY /
+# PC-RECOVERY.
 #
 # Emits a structured JSON event log to /tmp/sync_safety_witness_<ts>.jsonl
 # with one event per filesystem mutation:
@@ -39,8 +40,11 @@ emit_event() {
 # Mirror of is_allowed_sync_file in tests/e2e_sync_git_safety.rs
 is_allowed_path() {
     local rel="$1"
+    if [[ "$rel" =~ ^\.beads/\.br-(db|jsonl)-write-[0-9a-f]{24}\.lock$ ]]; then
+        return 0
+    fi
     case "$rel" in
-        .beads/.manifest.json|.beads/metadata.json|.beads/last-touched) return 0 ;;
+        .beads/.manifest.json|.beads/.write.lock|.beads/metadata.json|.beads/last-touched) return 0 ;;
         .beads/*.jsonl|.beads/*.jsonl.tmp|.beads/*.db|.beads/*.db-wal|.beads/*.db-shm|.beads/*.db-journal) return 0 ;;
         .beads/.br_history/*.meta.json) return 0 ;;
         .beads/.br_recovery/*.bak|.beads/.br_recovery/*.rebuild-failed|.beads/.br_recovery/*.truncated-wal) return 0 ;;

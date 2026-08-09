@@ -40,6 +40,7 @@ metadata:
 | **Git is YOUR job** | br only touches `.beads/` -- you must `git add .beads/ && git commit` |
 | **No cycles allowed** | `br dep cycles` must return empty |
 | **Resolve actor at runtime** | Use `ACTOR="${BR_ACTOR:-assistant}"` and pass `--actor "$ACTOR"` |
+| **Discover issue types first** | Before creating, updating, filtering, or reasoning about types, run `br capabilities --format json` in the target workspace |
 
 ## Quick Workflow
 
@@ -85,7 +86,7 @@ br reopen --actor "$ACTOR" <id>                      # Reopen closed issue
 ```bash
 br create --actor "$ACTOR" "Title" \
   --priority 1 \             # 0-4 scale (0=critical, 4=backlog)
-  --type task \              # task, bug, feature, epic, question, docs
+  --type task \              # Use issue_types acceptance metadata
   --assignee "user@..." \    # Optional assignee
   --labels backend,auth \    # Comma-separated labels
   --description "..."        # Detailed description
@@ -200,7 +201,27 @@ br lint --json                       # Lint issues for problems
 
 ## Issue Types
 
-`task`, `bug`, `feature`, `epic`, `question`, `docs`
+Before creating, updating, filtering, or otherwise reasoning about issue types,
+run this in the target workspace:
+
+```bash
+br capabilities --format json
+```
+
+Use the complete merged `issue_types` response:
+
+- `standard_types` provides canonical suggestions.
+- `accepts_custom_types` says whether unregistered strings are valid.
+- `types` contains behavior-bearing registrations only; omission means neutral
+  capabilities, not invalid syntax.
+- `active_profiles` identifies profiles contributing registrations.
+
+If `standard_types` or `accepts_custom_types` is absent, treat the response as
+legacy `br.capabilities.v1`; preserve the historical standard/custom behavior
+instead of inferring that omitted names are forbidden. Read
+`.beads/policy.yaml` directly only for troubleshooting. Normal decisions use
+the CLI response because it merges and validates built-ins, profiles, and
+project overrides.
 
 ## Output Formats
 

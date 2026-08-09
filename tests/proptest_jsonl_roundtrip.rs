@@ -338,6 +338,8 @@ prop_compose! {
             Just(DependencyType::ParentChild),
             Just(DependencyType::WaitsFor),
             Just(DependencyType::Related),
+            Just(DependencyType::DerivedFrom),
+            Just(DependencyType::Implements),
         ],
     ) -> RoundTripCase {
         let source_id = format!("bd-{suffix}");
