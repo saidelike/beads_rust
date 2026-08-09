@@ -7,7 +7,7 @@
   },
   "plugins": [
     {
-      "name": "beads",
+      "name": "beads-rust",
       "source": "./",
       "displayName": "Beads (br)",
       "description": "Official br (beads_rust) skill: create, triage, and unblock issues; find ready work; keep SQLite and issues.jsonl in sync. Agent instructions only — the br binary is installed separately.",

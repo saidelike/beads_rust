@@ -893,6 +893,11 @@ fn plugin_marketplace_publishes_only_the_br_skill() {
 
     let plugin = read_plugin_manifest("plugin.json");
     assert_eq!(
+        plugin["name"].as_str(),
+        Some("beads-rust"),
+        "the public plugin id must remain beads-rust"
+    );
+    assert_eq!(
         entry["name"].as_str(),
         plugin["name"].as_str(),
         "marketplace entry name must match the plugin manifest name"
@@ -924,6 +929,21 @@ fn plugin_marketplace_publishes_only_the_br_skill() {
         assert!(
             !skill_dir.join("bd-to-br-migration").exists(),
             "the published skill directory must not carry the opt-in migration skill"
+        );
+    }
+}
+
+#[test]
+fn plugin_readme_documents_claude_and_codex_discovery() {
+    let readme = fs::read_to_string("README.md").expect("read README.md");
+
+    for command in [
+        "/plugin install beads-rust@beads-rust",
+        "codex plugin add beads-rust@beads-rust",
+    ] {
+        assert!(
+            readme.contains(command),
+            "README plugin instructions must contain `{command}`"
         );
     }
 }
